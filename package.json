@@ -1,0 +1,28 @@
+{
+  "name": "pi-rov",
+  "version": "0.0.0",
+  "private": true,
+  "description": "pro-vi's suite of Pi coding-agent extensions.",
+  "author": "pro-vi",
+  "license": "MIT",
+  "homepage": "https://github.com/pro-vi/pi-rov#readme",
+  "bugs": {
+    "url": "https://github.com/pro-vi/pi-rov/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pro-vi/pi-rov.git"
+  },
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "npm run check --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

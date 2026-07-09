@@ -1,0 +1,16 @@
+# dependencies / build output
+node_modules/
+dist/
+*.tgz
+
+# local runtime + eval artifacts (may contain raw transcript/tool output)
+logs/
+reports/
+*.log
+
+# secrets
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store

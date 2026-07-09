@@ -1,0 +1,62 @@
+{
+	"name": "pi-codex-fast-mode",
+	"version": "0.1.0",
+	"description": "Pi extension that enables OpenAI Codex fast mode via service_tier=priority.",
+	"author": "pro-vi",
+	"license": "MIT",
+	"homepage": "https://github.com/pro-vi/pi-rov/tree/main/packages/pi-codex-fast-mode#readme",
+	"bugs": {
+		"url": "https://github.com/pro-vi/pi-rov/issues"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/pro-vi/pi-rov.git",
+		"directory": "packages/pi-codex-fast-mode"
+	},
+	"type": "module",
+	"main": "./index.ts",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi",
+		"codex",
+		"openai",
+		"fast-mode"
+	],
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE",
+		"docs/images/codex-fast-mode.png",
+		"package.json"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"test": "node --import=tsx --test test/*.test.ts",
+		"smoke-test": "pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./index.ts -p '/codex-fast help' && pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./index.ts -p '/codex-fast status'",
+		"check": "npm run typecheck && npm run test && npm run smoke-test"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		],
+		"image": "https://raw.githubusercontent.com/pro-vi/pi-rov/main/packages/pi-codex-fast-mode/docs/images/codex-fast-mode.png"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "^0.74.0",
+		"@earendil-works/pi-coding-agent": "^0.74.0",
+		"@types/node": "^24.3.0",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"publishConfig": {
+		"access": "public"
+	}
+}

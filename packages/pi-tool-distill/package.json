@@ -1,0 +1,68 @@
+{
+  "name": "pi-tool-distill",
+  "version": "0.1.0",
+  "description": "Pi extension for recoverable semantic tool-result compression.",
+  "author": "pro-vi",
+  "license": "MIT",
+  "homepage": "https://github.com/pro-vi/pi-rov/tree/main/packages/pi-tool-distill#readme",
+  "bugs": {
+    "url": "https://github.com/pro-vi/pi-rov/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pro-vi/pi-rov.git",
+    "directory": "packages/pi-tool-distill"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "tool-results",
+    "distillation"
+  ],
+  "files": [
+    "src/",
+    "scripts/",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import=tsx --test test/*.test.ts",
+    "smoke-test": "agent_dir=$(mktemp -d) && PI_CODING_AGENT_DIR=$agent_dir pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./src/index.ts -p '/distill help' && PI_CODING_AGENT_DIR=$agent_dir pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./src/index.ts -p '/distill status' && PI_CODING_AGENT_DIR=$agent_dir pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./src/index.ts -p '/distill policy list'; status=$?; rm -rf $agent_dir; exit $status",
+    "e2e:stats": "node --import=tsx --test test/e2e-stats.test.ts",
+    "eval:scan": "node --import=tsx scripts/eval.mjs scan",
+    "eval:run": "node --import=tsx scripts/eval.mjs run",
+    "eval:report": "node --import=tsx scripts/eval.mjs report",
+    "eval:synthetic": "node --import=tsx scripts/eval.mjs synthetic",
+    "check": "npm run typecheck && npm test && npm run smoke-test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.21.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
