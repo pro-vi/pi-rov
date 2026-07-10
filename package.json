@@ -17,6 +17,13 @@
   "workspaces": [
     "packages/*"
   ],
+  "pi": {
+    "extensions": [
+      "./packages/pi-canvas/src/index.ts",
+      "./packages/pi-tool-distill/src/index.ts",
+      "./packages/pi-codex-fast-mode/index.ts"
+    ]
+  },
   "scripts": {
     "check": "npm run check --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
