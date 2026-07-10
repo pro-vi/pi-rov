@@ -5,8 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme, ToolDefinition, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { BrowserHostSessionManager } from "../src/browser-host.js";
-import { createFormCanvasRequest } from "../src/builtin-form-renderer.js";
+import { canvasBrowserRenderer, createFormCanvasRequest } from "../src/builtin-form-renderer.js";
 import { formatBrowserHostReceiptFileName } from "../src/browser-host-receipts.js";
+import { BrowserArtifactRendererRegistry } from "../src/browser-renderer.js";
 import { isRecord } from "../src/json.js";
 import { PiCanvasRuntime } from "../src/runtime.js";
 import { createCanvasStore } from "../src/store.js";
@@ -1280,6 +1281,86 @@ void test("canvas_create can create and present a browser-host review decision a
   await rm(dir, { recursive: true, force: true });
 });
 
+void test("canvas_update validates registered open browser renderers without mutating on rejection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-canvas-tools-"));
+  const runtime = new PiCanvasRuntime(createCanvasStore("/tmp/project", { baseDir: dir, now: () => new Date("2026-06-27T00:00:00.000Z") }));
+  const browserRegistry = new BrowserArtifactRendererRegistry();
+  browserRegistry.register({
+    ...canvasBrowserRenderer,
+    id: "test.open-renderer",
+    label: "Open test renderer",
+    updatePolicy: "open",
+    validateState(state) {
+      if (!isRecord(state) || typeof state.value !== "number" || state.value > 5) {
+        throw new Error("open renderer requires value <= 5");
+      }
+    },
+  });
+  await runtime.create({
+    artifactId: "open-browser",
+    title: "Open Browser",
+    initialState: { value: 1 },
+    viewKind: "browser-host-artifact",
+    view: {
+      kind: "browser-host-artifact",
+      bridgeVersion: 1,
+      host: "local-browser-host",
+      fallback: "terminal-render",
+      transport: "http-json",
+      rendererId: "test.open-renderer",
+      rendererVersion: 1,
+    },
+    actions: [{ type: "set", path: "value", label: "Update value" }],
+  });
+  const tools = new Map<string, ToolDefinition>();
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      tools.set(tool.name, tool);
+    },
+  } as ExtensionAPI;
+  registerCanvasTools(pi, () => runtime, undefined, browserRegistry);
+  const updateTool = tools.get("canvas_update");
+  assert.ok(updateTool);
+
+  const updated = await updateTool.execute(
+    "tool-valid",
+    { artifactId: "open-browser", path: "value", value: 3, expectedStateVersion: 1 },
+    undefined,
+    undefined,
+    makeExtensionContext(),
+  );
+  assert.ok(isRecord(updated.details));
+  assert.ok(isRecord(updated.details.canvas));
+  assert.ok(isRecord(updated.details.canvas.state));
+  assert.equal(updated.details.canvas.state.version, 2);
+
+  await assert.rejects(
+    () => updateTool.execute(
+      "tool-invalid",
+      { artifactId: "open-browser", path: "value", value: 9, expectedStateVersion: 2 },
+      undefined,
+      undefined,
+      makeExtensionContext(),
+    ),
+    /open renderer requires value <= 5/,
+  );
+  assert.equal((await runtime.read("open-browser"))?.state.version, 2);
+  assert.deepEqual((await runtime.read("open-browser"))?.state.state, { value: 3 });
+
+  await assert.rejects(
+    () => updateTool.execute(
+      "tool-stale",
+      { artifactId: "open-browser", path: "value", value: 9, expectedStateVersion: 1 },
+      undefined,
+      undefined,
+      makeExtensionContext(),
+    ),
+    /Canvas stale state version: 1 != 2/,
+  );
+
+  await rm(dir, { recursive: true, force: true });
+});
+
 void test("canvas_present rejects unknown browser renderers at host resolution", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-canvas-tools-"));
   const runtime = new PiCanvasRuntime(createCanvasStore("/tmp/project", { baseDir: dir, now: () => new Date("2026-06-27T00:00:00.000Z") }));
@@ -1308,10 +1389,20 @@ void test("canvas_present rejects unknown browser renderers at host resolution",
   registerCanvasTools(pi, () => runtime);
   const presentTool = tools.get("canvas_present");
   const readTool = tools.get("canvas_read");
+  const updateTool = tools.get("canvas_update");
   const exportTool = tools.get("canvas_export");
   assert.ok(presentTool);
   assert.ok(readTool);
+  assert.ok(updateTool);
   assert.ok(exportTool);
+
+  await assert.rejects(
+    () => updateTool.execute("tool-update", { artifactId: "unknown-browser", path: "value", value: 1 }, undefined, undefined, makeExtensionContext()),
+    /Cannot update browser-host artifact: renderer is not registered: missing\.browser-renderer v1/,
+  );
+  const unchanged = await runtime.read("unknown-browser");
+  assert.equal(unchanged?.state.version, 1);
+  assert.deepEqual(unchanged?.state.state, { value: 0 });
 
   const read = await readTool.execute("tool-read", { artifactId: "unknown-browser" }, undefined, undefined, makeExtensionContext());
   const readText = readFirstText(read);

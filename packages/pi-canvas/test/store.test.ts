@@ -319,6 +319,23 @@ void test("update only accepts declared safe action paths", async () => {
     () => store.create({ artifactId: "sparse", title: "Sparse", initialState: { items: [] }, actions: [{ type: "set", path: "items.999999", label: "Sparse" }] }),
     /Unsafe canvas action path/,
   );
+  await assert.rejects(
+    () => store.create({ artifactId: "spaced", title: "Spaced", initialState: { value: 0 }, actions: [{ type: "set", path: " value ", label: "Spaced" }] }),
+    /Unsafe canvas action path/,
+  );
+  for (const reserved of ["__proto__", "constructor", "prototype"]) {
+    const artifactId = `reserved-${reserved.replaceAll("_", "x")}`;
+    await assert.rejects(
+      () => store.create({
+        artifactId,
+        title: "Reserved path",
+        initialState: { components: {} },
+        actions: [{ type: "set", path: `components.${reserved}`, label: "Reserved" }],
+      }),
+      /Unsafe canvas action path/,
+    );
+    assert.equal(await store.read(artifactId), undefined);
+  }
 
   assert.deepEqual((await store.read("demo"))?.state.state, { value: 0 });
 

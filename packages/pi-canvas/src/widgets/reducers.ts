@@ -8,7 +8,7 @@
 //   - note is orthogonal   — never changes status, never clears confirmation
 // `status` is derived, never stored, so there is no co-variance to keep in sync.
 
-import { isJsonObject } from "../json.js";
+import { isJsonObject, isSafeJsonObjectKey } from "../json.js";
 import type { JsonObject, JsonValue } from "../types.js";
 import {
   type FormActionEnvelope,
@@ -63,39 +63,75 @@ export function widgetStateToJson(w: WidgetState): JsonObject {
   };
 }
 
-/** Rehydrate a persisted/foreign `value` only if it fits the widget's kind; otherwise null (untouched).
- *  Stops a stale or hand-edited state file from reading an out-of-contract value back as "answered". */
-function normalizeWidgetValue(def: WidgetDef, raw: JsonValue | undefined): JsonValue | null {
-  if (raw === undefined || raw === null) return null;
+type WidgetValueNormalization = { ok: true; value: JsonValue | null } | { ok: false };
+
+function ratingMax(def: WidgetDef): number {
+  return typeof def.max === "number" && def.max > 0 ? def.max : 5;
+}
+
+function normalizeProvidedWidgetValue(def: WidgetDef, raw: JsonValue): WidgetValueNormalization {
   if (def.kind === "rating") {
-    const max = typeof def.max === "number" && def.max > 0 ? def.max : 5;
-    return typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= max ? raw : null;
+    const max = ratingMax(def);
+    return typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= max
+      ? { ok: true, value: raw }
+      : { ok: false };
   }
   if (def.kind === "short-text") {
-    return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
+    return typeof raw === "string"
+      ? { ok: true, value: raw.trim().length > 0 ? raw : null }
+      : { ok: false };
   }
-  return null; // select / design-variant / html-embed carry no scalar value
+  return { ok: false }; // select / design-variant / html-embed carry no scalar value
+}
+
+/** Rehydrate a persisted/foreign `value` only if it fits the widget's kind; otherwise null (untouched). */
+function normalizeWidgetValue(def: WidgetDef, raw: JsonValue | undefined): JsonValue | null {
+  if (raw === undefined || raw === null) return null;
+  const normalized = normalizeProvidedWidgetValue(def, raw);
+  return normalized.ok ? normalized.value : null;
+}
+
+function isSelectionWidget(def: WidgetDef): boolean {
+  return def.kind === "single-select" || def.kind === "multi-select" || def.kind === "design-variant";
+}
+
+function isSingleSelectionWidget(def: WidgetDef): boolean {
+  return def.kind === "single-select" || def.kind === "design-variant";
+}
+
+/** Keep only reducer-reachable selections for the current definition; malformed input degrades to untouched. */
+function normalizeWidgetSelections(def: WidgetDef, raw: JsonValue | undefined): Record<string, OptionAnswer> {
+  if (!isSelectionWidget(def) || !isJsonObject(raw)) return {};
+  const optionIds = new Set((def.options ?? []).map((option) => option.id));
+  const selections: Array<[string, OptionAnswer]> = [];
+  for (const [key, answer] of Object.entries(raw)) {
+    if (!isSafeJsonObjectKey(key) || !optionIds.has(key)) continue;
+    if (answer === "affirm" || answer === "negate" || answer === "unset") selections.push([key, answer]);
+  }
+  if (isSingleSelectionWidget(def) && selections.length > 1) return {};
+  return Object.fromEntries(selections);
 }
 
 export function widgetStateFromJson(value: JsonValue | undefined, def: WidgetDef): WidgetState {
   if (!isJsonObject(value)) return emptyWidgetState(def);
-  const selections: Record<string, OptionAnswer> = {};
-  if (isJsonObject(value.selections)) {
-    for (const [key, answer] of Object.entries(value.selections)) {
-      if (answer === "affirm" || answer === "negate" || answer === "unset") selections[key] = answer;
-    }
-  }
-  const rawValue = value.value;
-  return {
+  const selections = normalizeWidgetSelections(def, value.selections);
+  const normalizedValue = normalizeWidgetValue(def, value.value);
+  const skipped = value.skipped === true && def.required !== true;
+  const unsure = !skipped && value.unsure === true && def.allowUnsure !== false;
+  const base: WidgetState = {
     kind: def.kind,
-    selections,
-    value: normalizeWidgetValue(def, rawValue),
-    unsure: value.unsure === true,
-    skipped: value.skipped === true,
+    selections: skipped || unsure ? {} : selections,
+    value: skipped || unsure ? null : normalizedValue,
+    unsure,
+    skipped,
     note: typeof value.note === "string" ? value.note : null,
-    confirmed: value.confirmed === true,
-    confirmedSignature: typeof value.confirmedSignature === "string" ? value.confirmedSignature : null,
+    confirmed: false,
+    confirmedSignature: null,
   };
+  const confirmedSignature = typeof value.confirmedSignature === "string" ? value.confirmedSignature : null;
+  return value.confirmed === true && deriveStatus(base) !== "untouched" && confirmedSignature === signatureOf(base)
+    ? { ...base, confirmed: true, confirmedSignature }
+    : base;
 }
 
 export function hasAnswer(w: WidgetState): boolean {
@@ -124,11 +160,17 @@ function clearConfirm(w: WidgetState): WidgetState {
   return { ...w, confirmed: false, confirmedSignature: null };
 }
 
+function invalidWidgetValueReason(def: WidgetDef): string {
+  return def.kind === "rating"
+    ? `rating for ${def.id} must be an integer 1..${ratingMax(def)}`
+    : `text for ${def.id} must be a string`;
+}
+
 /** Apply one op to a widget's sub-state, enforcing the answer-model invariants. */
 export function reduceWidget(def: WidgetDef, current: WidgetState, action: FormActionEnvelope): WidgetReduceResult {
   const kind = def.kind;
-  const isSelect = kind === "single-select" || kind === "multi-select" || kind === "design-variant";
-  const isSingle = kind === "single-select" || kind === "design-variant";
+  const isSelect = isSelectionWidget(def);
+  const isSingle = isSingleSelectionWidget(def);
   const optionIds = new Set((def.options ?? []).map((o) => o.id));
 
   switch (action.op) {
@@ -193,18 +235,10 @@ export function reduceWidget(def: WidgetDef, current: WidgetState, action: FormA
         return { ok: false, reason: `widget ${def.id} (${kind}) does not take a value` };
       }
       const raw = action.value;
-      if (kind === "rating") {
-        const max = typeof def.max === "number" && def.max > 0 ? def.max : 5;
-        if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > max) {
-          return { ok: false, reason: `rating for ${def.id} must be an integer 1..${max}` };
-        }
-      } else if (typeof raw !== "string") {
-        return { ok: false, reason: `text for ${def.id} must be a string` };
-      }
-      // Normalize empty/whitespace-only text to null so canonical state never
-      // stores a blank string that reads back as an answer.
-      const value = typeof raw === "string" && raw.trim().length === 0 ? null : raw;
-      return { ok: true, next: clearConfirm({ ...current, value, unsure: false, skipped: false, selections: {} }) };
+      if (raw === undefined) return { ok: false, reason: invalidWidgetValueReason(def) };
+      const normalized = normalizeProvidedWidgetValue(def, raw);
+      if (!normalized.ok) return { ok: false, reason: invalidWidgetValueReason(def) };
+      return { ok: true, next: clearConfirm({ ...current, value: normalized.value, unsure: false, skipped: false, selections: {} }) };
     }
     case "confirm": {
       if (deriveStatus(current) === "untouched") return { ok: false, reason: `nothing to confirm for ${def.id}` };

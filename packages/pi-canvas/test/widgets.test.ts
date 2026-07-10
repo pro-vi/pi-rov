@@ -9,6 +9,7 @@ import {
   reduceWidget,
   requiredRemaining,
   widgetStateFromJson,
+  widgetStateToJson,
   type WidgetReduceResult,
 } from "../src/widgets/reducers.js";
 import {
@@ -152,25 +153,59 @@ test("required short-text is not satisfied by an empty or whitespace value", () 
   assert.deepEqual(requiredRemaining(def, state), []);
 });
 
-test("reserved object keys are rejected as widget ids", () => {
+test("reserved object keys are rejected as widget and option ids", () => {
   for (const id of ["__proto__", "constructor", "prototype"]) {
     assert.throws(
       () => assertValidFormDefinition({ components: [{ id, kind: "single-select", prompt: id, options: [{ id: "a", title: "A" }] }] }),
       /invalid widget id/,
     );
+    assert.throws(
+      () => assertValidFormDefinition({ components: [{ id: "safe", kind: "single-select", prompt: id, options: [{ id, title: "A" }] }] }),
+      /invalid option id/,
+    );
   }
 });
 
-test("widgetStateFromJson drops out-of-contract values to untouched (kind-aware rehydration)", () => {
+test("widgetStateFromJson drops out-of-contract values and selections to untouched (kind-aware rehydration)", () => {
   const rating: WidgetDef = { id: "r", kind: "rating", prompt: "r", max: 5 };
   assert.equal(widgetStateFromJson({ value: 9999 }, rating).value, null); // out of range
   assert.equal(widgetStateFromJson({ value: {} }, rating).value, null); // wrong type
   assert.equal(deriveStatus(widgetStateFromJson({ value: 9999 }, rating)), "untouched");
   assert.equal(widgetStateFromJson({ value: 3 }, rating).value, 3); // in-range survives
+  assert.deepEqual(widgetStateFromJson({ selections: { ghost: "affirm" } }, rating).selections, {});
+
   const text: WidgetDef = { id: "t", kind: "short-text", prompt: "t" };
   assert.equal(widgetStateFromJson({ value: "   " }, text).value, null); // whitespace-only
   assert.equal(widgetStateFromJson({ value: 42 }, text).value, null); // wrong type
   assert.equal(widgetStateFromJson({ value: "ok" }, text).value, "ok"); // real text survives
+
+  const select = single("s", ["a", "b"], true);
+  assert.deepEqual(widgetStateFromJson({ selections: { a: "affirm", ghost: "negate" } }, select).selections, { a: "affirm" });
+  const doubleSelection = widgetStateFromJson({ selections: { a: "affirm", b: "negate" } }, select);
+  assert.deepEqual(doubleSelection.selections, {});
+  assert.equal(deriveStatus(doubleSelection), "untouched");
+  const reservedSelection = Object.fromEntries([["__proto__", "affirm"]]);
+  assert.deepEqual(widgetStateFromJson({ selections: reservedSelection }, select).selections, {});
+
+  const unsure = widgetStateFromJson({ selections: { a: "affirm" }, unsure: true }, select);
+  assert.deepEqual(unsure.selections, {});
+  assert.equal(deriveStatus(unsure), "unsure");
+  const noUnsure = { ...select, allowUnsure: false };
+  assert.equal(deriveStatus(widgetStateFromJson({ unsure: true }, noUnsure)), "untouched");
+  assert.equal(deriveStatus(widgetStateFromJson({ skipped: true }, select)), "untouched");
+
+  const answered = unwrap(reduceWidget(select, emptyWidgetState(select), { op: "affirm", optionId: "a" }));
+  const confirmed = unwrap(reduceWidget(select, answered, { op: "confirm" }));
+  assert.equal(widgetStateFromJson(widgetStateToJson(confirmed), select).confirmed, true);
+  const staleConfirmation = widgetStateFromJson({ ...widgetStateToJson(confirmed), confirmedSignature: "stale" }, select);
+  assert.equal(staleConfirmation.confirmed, false);
+  assert.equal(staleConfirmation.confirmedSignature, null);
+  const emptyConfirmation = widgetStateFromJson(
+    { confirmed: true, confirmedSignature: JSON.stringify(["", null, false, false]) },
+    select,
+  );
+  assert.equal(deriveStatus(emptyConfirmation), "untouched");
+  assert.equal(emptyConfirmation.confirmed, false);
 });
 
 test("form source builders declare one path per component plus form.submitted", () => {

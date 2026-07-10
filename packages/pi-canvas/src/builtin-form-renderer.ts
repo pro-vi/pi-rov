@@ -449,6 +449,8 @@ export const canvasBrowserRenderer: BrowserArtifactRenderer = {
   // the human commits them in the browser. Agent-facing tool/command writes are rejected (ADR 0004
   // trust model). canvas_update stays open for terminal canvases and third-party browser renderers.
   updatePolicy: "browser-only",
+  updatePolicyRejectionMessage:
+    "This is a browser-host canvas artifact: the human commits answers in the browser session (open it with canvas_present), so canvas_update cannot write its state. To change the questions, create a new canvas.",
   playbook: FORM_PLAYBOOK,
   actionSchema: buildFormActionSchema(),
   defaultActions: [{ type: "set", path: "form.submitted", label: "Submit form" }],

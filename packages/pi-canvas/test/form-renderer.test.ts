@@ -262,7 +262,7 @@ test("form client escapes hostile widget text into the DOM (executable XSS pin)"
       return el();
     },
   };
-  runInNewContext(clientScript as string, { document: documentStub });
+  runInNewContext(clientScript, { document: documentStub });
 
   assert.ok(appHtml.length > 0, "client rendered into #app");
   assert.doesNotMatch(appHtml, /autofocus data-owned="bad"/); // no attribute breakout

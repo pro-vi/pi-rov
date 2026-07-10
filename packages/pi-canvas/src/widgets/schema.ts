@@ -6,7 +6,7 @@
 // enum, so an option set can change without a rejected schema (unlike the legacy
 // option chooser).
 
-import { isJsonObject } from "../json.js";
+import { isJsonObject, isSafeJsonObjectKey, isSafeJsonPathSegment } from "../json.js";
 import type { CanvasActionDefinition, JsonObject, JsonValue } from "../types.js";
 import { emptyWidgetState, FORM_OPS, widgetStateToJson } from "./reducers.js";
 import {
@@ -17,10 +17,6 @@ import {
   type WidgetOptionDef,
 } from "./types.js";
 
-const WIDGET_ID_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/;
-// Reserved JS object keys match the pattern but corrupt state: components.__proto__ writes the
-// prototype instead of an own key, and the write silently vanishes on JSON.stringify. Reject them.
-const RESERVED_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const PREVIEW_KINDS: readonly PreviewKind[] = ["motion", "density", "spacing", "swatch"];
 
 /** Lenient parse of the stored form view `props` into a FormDefinition (for rendering). */
@@ -65,7 +61,7 @@ export function assertValidFormDefinition(def: FormDefinition): void {
   if (def.components.length === 0) throw new Error("form requires at least one component");
   const seen = new Set<string>();
   for (const wdef of def.components) {
-    if (!WIDGET_ID_PATTERN.test(wdef.id) || RESERVED_OBJECT_KEYS.has(wdef.id)) throw new Error(`invalid widget id: ${wdef.id}`);
+    if (!isSafeJsonPathSegment(wdef.id)) throw new Error(`invalid widget id: ${wdef.id}`);
     if (seen.has(wdef.id)) throw new Error(`duplicate widget id: ${wdef.id}`);
     seen.add(wdef.id);
     const needsOptions = wdef.kind === "single-select" || wdef.kind === "multi-select" || wdef.kind === "design-variant";
@@ -84,6 +80,7 @@ export function assertValidFormDefinition(def: FormDefinition): void {
     }
     const optionIds = new Set<string>();
     for (const opt of wdef.options ?? []) {
+      if (!isSafeJsonObjectKey(opt.id)) throw new Error(`invalid option id in ${wdef.id}: ${opt.id}`);
       if (optionIds.has(opt.id)) throw new Error(`duplicate option id in ${wdef.id}: ${opt.id}`);
       optionIds.add(opt.id);
     }

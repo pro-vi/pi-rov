@@ -64,11 +64,12 @@ export interface BrowserArtifactRenderer {
   /**
    * Governs agent-facing state writes (canvas_update / `/canvas update`), enforced in the
    * update guard. "open" (default) validates the write via validateState; "browser-only"
-   * rejects it outright — the human commits answers through the browser session, so every
-   * declared path is an answer path the agent must not forge. The browser action path and
-   * direct runtime.update are unaffected.
+   * reserves state writes for the browser session. The browser action path and direct
+   * runtime.update are unaffected.
    */
   updatePolicy?: "open" | "browser-only";
+  /** Renderer-owned steering shown when updatePolicy is "browser-only". */
+  updatePolicyRejectionMessage?: string;
   validateState?(state: JsonValue): void;
   renderHtml(readback: CanvasReadback, bootstrap: BrowserHostBootstrap): string;
   reduceAction(readback: CanvasReadback, action: JsonObject): BrowserRendererTransition;

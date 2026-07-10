@@ -8,11 +8,13 @@ import {
   cloneJson,
   isJsonValue,
   isRecord,
+  isSafeJsonPath,
   readActionDefinitions,
   readNumber,
   readString,
   readViewKind,
   serializeJson,
+  setJsonPath,
 } from "./json.js";
 import { validateHtmlIframeBridgePolicy } from "./html-iframe-bridge.js";
 import type {
@@ -285,14 +287,6 @@ export function sha256(input: string): string {
   return createHash("sha256").update(input).digest("hex");
 }
 
-function setJsonPath(value: JsonValue, path: string, nextValue: JsonValue): JsonValue {
-  const parts = path.split(".").map((part) => part.trim()).filter(Boolean);
-  if (parts.length === 0) {
-    return cloneJson(nextValue);
-  }
-  return setJsonPathParts(value, parts, nextValue);
-}
-
 function buildCanvasViewDefinition(request: CreateCanvasRequest): CanvasViewDefinition {
   if (request.view !== undefined) {
     assertCanvasViewDefinition(request.view);
@@ -502,17 +496,7 @@ function assertUpdateExpectationMatches(request: UpdateCanvasRequest, state: Can
 }
 
 function assertSafeJsonPath(path: string, label: string): void {
-  const parts = path.split(".").map((part) => part.trim()).filter(Boolean);
-  if (parts.length === 0 || parts.length > 16 || parts.join(".") !== path.trim()) {
-    throw new Error(`Unsafe ${label}: ${path}`);
-  }
-  for (const part of parts) {
-    // Reject reserved JS object keys (defense in depth with WIDGET_ID_PATTERN): writing to
-    // __proto__/constructor/prototype corrupts the target object and the write vanishes on save.
-    if (!/^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/.test(part) || part === "__proto__" || part === "constructor" || part === "prototype") {
-      throw new Error(`Unsafe ${label}: ${path}`);
-    }
-  }
+  if (!isSafeJsonPath(path)) throw new Error(`Unsafe ${label}: ${path}`);
 }
 
 function assertStateMatchesSchema(schema: JsonObject, value: JsonValue, label: string): void {
@@ -576,32 +560,6 @@ function matchesSchemaType(value: JsonValue, type: string): boolean {
 
 function jsonEqual(left: JsonValue, right: JsonValue): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function setJsonPathParts(value: JsonValue, parts: string[], nextValue: JsonValue): JsonValue {
-  const [head, ...tail] = parts;
-  if (!head) return cloneJson(nextValue);
-  if (tail.length === 0) {
-    if (Array.isArray(value) && isArrayIndex(head)) {
-      const copy = value.map((item) => cloneJson(item));
-      copy[Number(head)] = cloneJson(nextValue);
-      return copy;
-    }
-    const object = isJsonRecord(value) ? cloneJson(value) : {};
-    object[head] = cloneJson(nextValue);
-    return object;
-  }
-  if (Array.isArray(value) && isArrayIndex(head)) {
-    const copy = value.map((item) => cloneJson(item));
-    const index = Number(head);
-    const child = copy[index] ?? {};
-    copy[index] = setJsonPathParts(child, tail, nextValue);
-    return copy;
-  }
-  const object = isJsonRecord(value) ? cloneJson(value) : {};
-  const child = object[head] ?? {};
-  object[head] = setJsonPathParts(child, tail, nextValue);
-  return object;
 }
 
 function parseCanvasSource(value: unknown): CanvasSource | undefined {
@@ -855,10 +813,6 @@ async function readValidProvenanceLog(path: string): Promise<string> {
 
 function isJsonRecord(value: unknown): value is { [key: string]: JsonValue } {
   return isRecord(value) && Object.values(value).every(isJsonValue);
-}
-
-function isArrayIndex(value: string): boolean {
-  return /^(0|[1-9]\d*)$/.test(value);
 }
 
 function assertSafeOptionalArtifactId(artifactId: string | undefined): void {

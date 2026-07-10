@@ -1,6 +1,41 @@
 import type { CanvasActionDefinition, CanvasActionType, CanvasSource, CanvasStateSnapshot, CanvasViewKind, JsonObject, JsonValue } from "./types.js";
 import { CANVAS_ACTION_TYPES, CANVAS_VIEW_KINDS } from "./types.js";
 
+const SAFE_JSON_PATH_SEGMENT_PATTERN = /^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/;
+const RESERVED_JSON_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
+/** Keys that can be assigned to ordinary JSON objects without invoking prototype machinery. */
+export function isSafeJsonObjectKey(value: string): boolean {
+  return !RESERVED_JSON_OBJECT_KEYS.has(value);
+}
+
+/** One safe dot-path segment for persisted canvas actions. */
+export function isSafeJsonPathSegment(value: string): boolean {
+  return SAFE_JSON_PATH_SEGMENT_PATTERN.test(value) && isSafeJsonObjectKey(value);
+}
+
+/** Dot-path grammar shared by store persistence and renderer preflight validation. */
+export function isSafeJsonPath(path: string): boolean {
+  const parts = path.split(".").map((part) => part.trim()).filter(Boolean);
+  return parts.length > 0 && parts.length <= 16 && parts.join(".") === path && parts.every(isSafeJsonPathSegment);
+}
+
+/** Project one safe dot-path write into a cloned JSON value without mutating the input. */
+export function setJsonPath(value: JsonValue, path: string, nextValue: JsonValue): JsonValue {
+  if (!isSafeJsonPath(path)) throw new Error(`Unsafe JSON path: ${path}`);
+  return setJsonPathParts(value, path.split("."), nextValue);
+}
+
+function setJsonPathParts(value: JsonValue, parts: string[], nextValue: JsonValue): JsonValue {
+  const [head, ...tail] = parts;
+  if (!head) return cloneJson(nextValue);
+  const object = isJsonObject(value) ? cloneJson(value) : {};
+  object[head] = tail.length === 0
+    ? cloneJson(nextValue)
+    : setJsonPathParts(object[head] ?? {}, tail, nextValue);
+  return object;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
