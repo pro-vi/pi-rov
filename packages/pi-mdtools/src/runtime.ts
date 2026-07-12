@@ -10,6 +10,7 @@ import type {
 	MdBinaryResolution,
 	MdCandidate,
 	MdCommandExecution,
+	MdErrorCode,
 	MdCommandRequest,
 	MdCommandRunner,
 	MdResultEnvelope,
@@ -77,6 +78,18 @@ interface HeadingContextSuccess {
 
 type HeadingContextOutcome = HeadingContextSuccess | HeadingLookupFailure;
 
+interface TaskLookupSuccess {
+	ok: true;
+	candidates: MdCandidate[];
+}
+
+interface TaskLookupFailure {
+	ok: false;
+	result: MdResultEnvelope;
+}
+
+type TaskLookupOutcome = TaskLookupSuccess | TaskLookupFailure;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -95,6 +108,10 @@ function integerValue(value: unknown, options: { min?: number; max?: number } = 
 	const max = options.max ?? Number.MAX_SAFE_INTEGER;
 	if (value > max) return undefined;
 	return value;
+}
+
+function taskStatusValue(value: unknown): "pending" | "done" | undefined {
+	return value === "pending" || value === "done" ? value : undefined;
 }
 
 function normalizeMaybeAtPath(path: string): string {
@@ -118,6 +135,89 @@ function commandMeta(_command: string, _file: string | undefined, execution: MdC
 
 function unresolvedMeta(args: string[], cwd: string): MdResultEnvelope["meta"] {
 	return { args, cwd };
+}
+
+const DEFAULT_NEXT_ACTIONS: Record<MdErrorCode, string> = {
+	E_MD_BINARY_MISSING: "Install mdtools so `md` is on PATH, or set MDTOOLS_MD_BIN to the md executable path, then retry.",
+	E_MD_COMMAND_ABORTED: "Retry the mdtools call; if it times out again, narrow the file or inspect the md binary directly.",
+	E_MD_COMMAND_FAILED: "Read error.stderr for the mdtools failure, refresh the structural target with the relevant md_* read tool, then retry.",
+	E_MD_JSON_PARSE: "Run /mdtools status to confirm the md binary, then retry or inspect the md command output outside Pi.",
+	E_MD_SCHEMA_MISMATCH: "Upgrade mdtools or re-run the matching md_* read tool; the installed md JSON shape did not match pi-mdtools expectations.",
+	E_ETAG_MISMATCH: "Re-read md_blocks for current etags, then retry with the fresh expectEtag.",
+	E_ETAG_UNAVAILABLE: "Upgrade mdtools to a version whose md blocks --json includes per-block etag fields, or retry without expectEtag if drift safety is not required.",
+	E_HEADING_NOT_FOUND: "Run md_outline for the current heading tree, then retry with an exact heading text.",
+	E_AMBIGUOUS_HEADING: "Choose one candidates[].occurrence value and retry with occurrence, sourceOccurrence, or destinationOccurrence as appropriate.",
+	E_OCCURRENCE_OUT_OF_RANGE: "Choose an occurrence value from candidates[] and retry.",
+	E_BAD_LOC: "Run md_tasks for current task locs, choose one candidates[].loc value, then retry md_set_task.",
+};
+
+function mdError(
+	code: MdErrorCode,
+	message: string,
+	options: { exitCode?: number | null; stderr?: string; hint?: string; nextAction?: string } = {},
+): NonNullable<MdResultEnvelope["error"]> {
+	const error: NonNullable<MdResultEnvelope["error"]> = {
+		code,
+		message,
+		nextAction: options.nextAction ?? DEFAULT_NEXT_ACTIONS[code],
+	};
+	if (options.exitCode !== undefined) error.exitCode = options.exitCode;
+	if (options.stderr !== undefined && options.stderr.trim().length > 0) error.stderr = options.stderr;
+	if (options.hint !== undefined && options.hint.trim().length > 0) error.hint = options.hint;
+	return error;
+}
+
+function resultWithError(options: {
+	status: "ambiguous" | "failed";
+	command: string;
+	file?: string;
+	meta: MdResultEnvelope["meta"];
+	code: MdErrorCode;
+	message: string;
+	candidates?: MdCandidate[];
+	exitCode?: number | null;
+	stderr?: string;
+	hint?: string;
+	nextAction?: string;
+}): MdResultEnvelope {
+	return {
+		status: options.status,
+		command: options.command,
+		...(options.file !== undefined ? { file: options.file } : {}),
+		...(options.candidates !== undefined ? { candidates: options.candidates } : {}),
+		error: mdError(options.code, options.message, {
+			...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
+			...(options.stderr !== undefined ? { stderr: options.stderr } : {}),
+			...(options.hint !== undefined ? { hint: options.hint } : {}),
+			...(options.nextAction !== undefined ? { nextAction: options.nextAction } : {}),
+		}),
+		meta: options.meta,
+	};
+}
+
+function unresolvedResultWithError(options: {
+	status: "ambiguous" | "failed";
+	command: string;
+	file?: string;
+	args: string[];
+	cwd: string;
+	code: MdErrorCode;
+	message: string;
+	candidates?: MdCandidate[];
+	hint?: string;
+	nextAction?: string;
+}): MdResultEnvelope {
+	return resultWithError({
+		status: options.status,
+		command: options.command,
+		...(options.file !== undefined ? { file: options.file } : {}),
+		meta: unresolvedMeta(options.args, options.cwd),
+		code: options.code,
+		message: options.message,
+		...(options.candidates !== undefined ? { candidates: options.candidates } : {}),
+		...(options.hint !== undefined ? { hint: options.hint } : {}),
+		...(options.nextAction !== undefined ? { nextAction: options.nextAction } : {}),
+	});
 }
 
 async function isExecutable(path: string): Promise<boolean> {
@@ -280,21 +380,26 @@ function errorMessage(execution: MdCommandExecution): string {
 
 function resultFromExecutionFailure(command: string, file: string | undefined, execution: MdCommandExecution): MdResultEnvelope {
 	const status = classifyFailureStatus(execution.stderr);
-	const error: MdResultEnvelope["error"] = {
-		message: errorMessage(execution),
-		exitCode: execution.code,
-	};
-	if (execution.stderr.trim().length > 0) error.stderr = execution.stderr;
-	if (execution.code === 4) {
-		error.hint = "Re-read the target with md_blocks or md_block to refresh current indices and etags, then retry.";
-	}
-	return {
+	const code: MdErrorCode = execution.killed
+		? "E_MD_COMMAND_ABORTED"
+		: execution.code === 4
+			? "E_ETAG_MISMATCH"
+			: status === "ambiguous"
+				? "E_AMBIGUOUS_HEADING"
+				: "E_MD_COMMAND_FAILED";
+	return resultWithError({
 		status,
 		command,
 		...(file !== undefined ? { file } : {}),
-		error,
 		meta: commandMeta(command, file, execution),
-	};
+		code,
+		message: errorMessage(execution),
+		exitCode: execution.code,
+		...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
+		...(execution.code === 4
+			? { hint: "Re-read the target with md_blocks or md_block to refresh current indices and etags, then retry." }
+			: {}),
+	});
 }
 
 function parseJsonObject(stdout: string): { ok: true; data: Record<string, unknown> } | { ok: false; message: string } {
@@ -356,6 +461,44 @@ function extractBlockEtags(blocksData: Record<string, unknown>): Map<number, str
 	return etags;
 }
 
+function taskCandidateFromEntry(entry: unknown): MdCandidate | undefined {
+	if (!isRecord(entry)) return undefined;
+	const loc = stringValue(entry.loc);
+	const status = taskStatusValue(entry.status);
+	if (loc === undefined || status === undefined) return undefined;
+	const blockIndex = integerValue(entry.block_index, { min: 0 });
+	const taskIndex = integerValue(entry.task_index, { min: 0 });
+	const heading = stringValue(entry.nearest_heading);
+	const summary = stringValue(entry.summary_text);
+	return {
+		role: "task",
+		loc,
+		status,
+		...(blockIndex !== undefined ? { blockIndex } : {}),
+		...(taskIndex !== undefined ? { taskIndex } : {}),
+		...(heading !== undefined ? { heading } : {}),
+		...(entry.span !== undefined ? { span: entry.span } : {}),
+		...(summary !== undefined && summary.length > 0 ? { snippet: summary } : {}),
+	};
+}
+
+function taskCandidatesFromData(data: Record<string, unknown>): MdCandidate[] | undefined {
+	const results = data.results;
+	if (!Array.isArray(results)) return undefined;
+	const candidates: MdCandidate[] = [];
+	for (const result of results) {
+		if (!isRecord(result)) return undefined;
+		const tasks = result.tasks;
+		if (!Array.isArray(tasks)) return undefined;
+		for (const task of tasks) {
+			const candidate = taskCandidateFromEntry(task);
+			if (candidate === undefined) return undefined;
+			candidates.push(candidate);
+		}
+	}
+	return candidates;
+}
+
 function selectCandidate(
 	candidates: HeadingCandidate[],
 	occurrence: number | undefined,
@@ -369,26 +512,32 @@ function selectCandidate(
 	if (candidates.length === 0) {
 		return {
 			ok: false,
-			result: {
+			result: unresolvedResultWithError({
 				status: "failed",
 				command,
 				file,
-				error: { message: `No ${role} heading matched.` },
-				meta: unresolvedMeta(args, cwd),
-			},
+				args,
+				cwd,
+				code: "E_HEADING_NOT_FOUND",
+				message: `No ${role} heading matched.`,
+			}),
 		};
 	}
 	if (occurrence === undefined && candidates.length > 1) {
+		const occurrenceParam = role === "target" ? "occurrence" : `${role}Occurrence`;
 		return {
 			ok: false,
-			result: {
+			result: unresolvedResultWithError({
 				status: "ambiguous",
 				command,
 				file,
+				args,
+				cwd,
+				code: "E_AMBIGUOUS_HEADING",
+				message: `Multiple ${role} headings matched; pass ${occurrenceParam}.`,
 				candidates: withRole,
-				error: { message: `Multiple ${role} headings matched; pass ${role === "target" ? "occurrence" : `${role}Occurrence`}.` },
-				meta: unresolvedMeta(args, cwd),
-			},
+				nextAction: `Choose one candidates[].occurrence value and retry with ${occurrenceParam}.`,
+			}),
 		};
 	}
 	const selectedOccurrence = occurrence ?? 1;
@@ -396,14 +545,16 @@ function selectCandidate(
 	if (candidate === undefined) {
 		return {
 			ok: false,
-			result: {
+			result: unresolvedResultWithError({
 				status: "failed",
 				command,
 				file,
+				args,
+				cwd,
+				code: "E_OCCURRENCE_OUT_OF_RANGE",
+				message: `${role} occurrence ${selectedOccurrence} is out of range.`,
 				candidates: withRole,
-				error: { message: `${role} occurrence ${selectedOccurrence} is out of range.` },
-				meta: unresolvedMeta(args, cwd),
-			},
+			}),
 		};
 	}
 	return { ok: true, candidate: { ...candidate, role } };
@@ -479,6 +630,20 @@ export class MdtoolsRuntime {
 	async setTask(params: SetTaskParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = ["set-task", "--json", "--status", params.status, "-i", params.loc, file];
+		const taskCandidates = await this.findTaskCandidates("md_set_task", file, args, signal);
+		if (!taskCandidates.ok) return taskCandidates.result;
+		if (!taskCandidates.candidates.some((candidate) => candidate.loc === params.loc)) {
+			return unresolvedResultWithError({
+				status: "failed",
+				command: "md_set_task",
+				file,
+				args,
+				cwd: this.cwd,
+				code: "E_BAD_LOC",
+				message: `No current task matched loc ${params.loc}.`,
+				candidates: taskCandidates.candidates,
+			});
+		}
 		return await this.runJson("md_set_task", args, file, signal);
 	}
 
@@ -523,30 +688,30 @@ export class MdtoolsRuntime {
 
 		if (params.expectEtag !== undefined) {
 			if (selected.candidate.etag === undefined) {
-				return {
+				return unresolvedResultWithError({
 					status: "failed",
 					command: "md_replace_section",
 					file,
+					args,
+					cwd: this.cwd,
+					code: "E_ETAG_UNAVAILABLE",
+					message: "Cannot verify expectEtag because md_blocks did not return etags.",
 					candidates: [selected.candidate],
-					error: {
-						message: "Cannot verify expectEtag because md_blocks did not return etags.",
-						hint: "Upgrade mdtools to a version whose md blocks --json includes per-block etag fields.",
-					},
-					meta: unresolvedMeta(args, this.cwd),
-				};
+					hint: "Upgrade mdtools to a version whose md blocks --json includes per-block etag fields.",
+				});
 			}
 			if (selected.candidate.etag !== params.expectEtag) {
-				return {
+				return unresolvedResultWithError({
 					status: "failed",
 					command: "md_replace_section",
 					file,
+					args,
+					cwd: this.cwd,
+					code: "E_ETAG_MISMATCH",
+					message: `Heading block etag mismatch: expected ${params.expectEtag}, found ${selected.candidate.etag}.`,
 					candidates: [selected.candidate],
-					error: {
-						message: `Heading block etag mismatch: expected ${params.expectEtag}, found ${selected.candidate.etag}.`,
-						hint: "Re-read md_blocks for current etags, then retry with the fresh expectEtag.",
-					},
-					meta: unresolvedMeta(args, this.cwd),
-				};
+					hint: "Re-read md_blocks for current etags, then retry with the fresh expectEtag.",
+				});
 			}
 		}
 
@@ -622,13 +787,15 @@ export class MdtoolsRuntime {
 		if (!Array.isArray(entries)) {
 			return {
 				ok: false,
-				result: {
+				result: unresolvedResultWithError({
 					status: "failed",
 					command,
 					file,
-					error: { message: "md outline JSON did not contain an entries array." },
-					meta: unresolvedMeta(originalArgs, this.cwd),
-				},
+					args: originalArgs,
+					cwd: this.cwd,
+					code: "E_MD_SCHEMA_MISMATCH",
+					message: "md outline JSON did not contain an entries array.",
+				}),
 			};
 		}
 
@@ -650,6 +817,32 @@ export class MdtoolsRuntime {
 			}
 		}
 		return candidates;
+	}
+
+	private async findTaskCandidates(
+		command: string,
+		file: string,
+		originalArgs: string[],
+		signal: AbortSignal | undefined,
+	): Promise<TaskLookupOutcome> {
+		const tasks = await this.runJsonData("md_tasks", ["tasks", "--json", file], file, signal);
+		if (!tasks.ok) return { ok: false, result: { ...tasks.result, command, meta: unresolvedMeta(originalArgs, this.cwd) } };
+		const candidates = taskCandidatesFromData(tasks.data);
+		if (candidates === undefined) {
+			return {
+				ok: false,
+				result: unresolvedResultWithError({
+					status: "failed",
+					command,
+					file,
+					args: originalArgs,
+					cwd: this.cwd,
+					code: "E_MD_SCHEMA_MISMATCH",
+					message: "md tasks JSON did not contain a results array.",
+				}),
+			};
+		}
+		return { ok: true, candidates };
 	}
 
 	private async runJson(
@@ -679,16 +872,16 @@ export class MdtoolsRuntime {
 		if (!resolution.found || resolution.path === undefined) {
 			return {
 				ok: false,
-				result: {
+				result: unresolvedResultWithError({
 					status: "failed",
 					command,
 					...(file !== undefined ? { file } : {}),
-					error: {
-						message: "mdtools binary not found.",
-						hint: "Install mdtools so `md` is on PATH, or set MDTOOLS_MD_BIN to the md executable path.",
-					},
-					meta: unresolvedMeta(args, this.cwd),
-				},
+					args,
+					cwd: this.cwd,
+					code: "E_MD_BINARY_MISSING",
+					message: "mdtools binary not found.",
+					hint: "Install mdtools so `md` is on PATH, or set MDTOOLS_MD_BIN to the md executable path.",
+				}),
 			};
 		}
 
@@ -710,13 +903,14 @@ export class MdtoolsRuntime {
 		if (!parsed.ok) {
 			return {
 				ok: false,
-				result: {
+				result: resultWithError({
 					status: "failed",
 					command,
 					...(file !== undefined ? { file } : {}),
-					error: { message: `Failed to parse md JSON output: ${parsed.message}` },
 					meta: commandMeta(command, file, execution),
-				},
+					code: "E_MD_JSON_PARSE",
+					message: `Failed to parse md JSON output: ${parsed.message}`,
+				}),
 			};
 		}
 

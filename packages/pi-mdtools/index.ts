@@ -3,6 +3,7 @@ import { defineTool, type ExtensionAPI, type ExtensionContext, withFileMutationQ
 import { Type } from "typebox";
 
 import { formatStatus, helpText, renderMdToolResult } from "./src/content.js";
+import { MD_TOOL_PROMPTS } from "./src/prompts.js";
 import { MdtoolsRuntime, resolveToolPath } from "./src/runtime.js";
 
 const COMMANDS = ["status", "help"];
@@ -101,7 +102,7 @@ const mdOutlineTool = defineTool({
 	name: "md_outline",
 	label: "Markdown Outline",
 	description: "Read a Markdown file's heading outline using mdtools/comrak and return JSON spans.",
-	promptSnippet: "Read Markdown heading outlines with mdtools/comrak JSON spans.",
+	...MD_TOOL_PROMPTS.md_outline,
 	parameters: OutlineParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).outline(params, signal));
@@ -112,7 +113,7 @@ const mdSectionTool = defineTool({
 	name: "md_section",
 	label: "Markdown Section",
 	description: "Read one Markdown section by exact heading text. Duplicate matches return ambiguous candidates unless occurrence is supplied.",
-	promptSnippet: "Read one Markdown section by heading with ambiguity candidates.",
+	...MD_TOOL_PROMPTS.md_section,
 	parameters: SectionParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).section(params, signal));
@@ -123,7 +124,7 @@ const mdTasksTool = defineTool({
 	name: "md_tasks",
 	label: "Markdown Tasks",
 	description: "List GFM checkbox tasks with structural locations, status, nearest heading, and source spans.",
-	promptSnippet: "List GFM task checkboxes with structural locs and headings.",
+	...MD_TOOL_PROMPTS.md_tasks,
 	parameters: TasksParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).tasks(params, signal));
@@ -134,7 +135,7 @@ const mdTableTool = defineTool({
 	name: "md_table",
 	label: "Markdown Table",
 	description: "Read Markdown table metadata or project rows by block index, selected columns, and filters.",
-	promptSnippet: "Read or project Markdown tables structurally.",
+	...MD_TOOL_PROMPTS.md_table,
 	parameters: TableParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).table(params, signal));
@@ -145,7 +146,7 @@ const mdBlocksTool = defineTool({
 	name: "md_blocks",
 	label: "Markdown Blocks",
 	description: "List top-level Markdown blocks with spans, previews, and mdtools etags when supported by the installed md binary.",
-	promptSnippet: "List Markdown blocks with spans, previews, and etags.",
+	...MD_TOOL_PROMPTS.md_blocks,
 	parameters: BlocksParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).blocks(params, signal));
@@ -156,7 +157,7 @@ const mdBlockTool = defineTool({
 	name: "md_block",
 	label: "Markdown Block",
 	description: "Read one Markdown block by index with content and mdtools metadata.",
-	promptSnippet: "Read one Markdown block by index.",
+	...MD_TOOL_PROMPTS.md_block,
 	parameters: BlockParams,
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		return await renderMdToolResult(await runtime(ctx).block(params, signal));
@@ -167,7 +168,7 @@ const mdSetTaskTool = defineTool({
 	name: "md_set_task",
 	label: "Set Markdown Task",
 	description: "Safely set a GFM checkbox task status by md_tasks structural loc. Mutates the file in place.",
-	promptSnippet: "Set a Markdown task checkbox by structural loc.",
+	...MD_TOOL_PROMPTS.md_set_task,
 	parameters: SetTaskParams,
 	executionMode: "sequential",
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -181,7 +182,7 @@ const mdMoveSectionTool = defineTool({
 	label: "Move Markdown Section",
 	description:
 		"Move a Markdown section before/after/into another heading using mdtools auto-releveling. Duplicate source/destination headings return candidates unless occurrences are supplied.",
-	promptSnippet: "Move Markdown sections structurally with auto-releveling and ambiguity checks.",
+	...MD_TOOL_PROMPTS.md_move_section,
 	parameters: MoveSectionParams,
 	executionMode: "sequential",
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -195,7 +196,7 @@ const mdReplaceSectionTool = defineTool({
 	label: "Replace Markdown Section",
 	description:
 		"Replace a Markdown section by heading. Mutates in place and can fail closed with expectEtag from md_blocks for the heading block.",
-	promptSnippet: "Replace Markdown sections by heading with optional etag drift guard.",
+	...MD_TOOL_PROMPTS.md_replace_section,
 	parameters: ReplaceSectionParams,
 	executionMode: "sequential",
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {

@@ -56,6 +56,29 @@ const blocksJson = {
 	],
 };
 
+const tasksJson = {
+	schema_version: "mdtools.v1",
+	results: [
+		{
+			file: "/work/doc.md",
+			tasks: [
+				{
+					loc: "2.0",
+					block_index: 2,
+					child_path: [0],
+					task_index: 0,
+					status: "pending",
+					depth: 0,
+					nearest_heading: "Beta",
+					nearest_heading_block_index: 2,
+					span: {},
+					summary_text: "Ship the thing",
+				},
+			],
+		},
+	],
+};
+
 test("resolveToolPath resolves relative paths and strips leading @", () => {
 	assert.equal(resolveToolPath("/repo", "@docs/a.md"), "/repo/docs/a.md");
 	assert.equal(resolveToolPath("/repo", "/tmp/a.md"), "/tmp/a.md");
@@ -71,6 +94,16 @@ test("outline shells out to md outline --json and returns parsed data", async ()
 	assert.deepEqual(result.data, { schema_version: "mdtools.v1", entries: [] });
 });
 
+test("malformed md JSON returns a stable parse recovery code", async () => {
+	const { runtime } = fakeRuntime((request) => execution(request, "not-json"));
+
+	const result = await runtime.outline({ file: "doc.md" });
+
+	assert.equal(result.status, "failed");
+	assert.equal(result.error?.code, "E_MD_JSON_PARSE");
+	assert.match(result.error?.nextAction ?? "", /md binary/);
+});
+
 test("section returns ambiguous candidates before reading duplicate headings", async () => {
 	const { runtime, calls } = fakeRuntime((request) => {
 		if (request.args[0] === "outline") return execution(request, JSON.stringify(outlineJson));
@@ -81,6 +114,8 @@ test("section returns ambiguous candidates before reading duplicate headings", a
 	const result = await runtime.section({ file: "doc.md", heading: "Alpha" });
 
 	assert.equal(result.status, "ambiguous");
+	assert.equal(result.error?.code, "E_AMBIGUOUS_HEADING");
+	assert.match(result.error?.nextAction ?? "", /occurrence/);
 	assert.equal(result.candidates?.length, 2);
 	assert.equal(result.candidates?.[0]?.etag, "etag-alpha-1");
 	assert.deepEqual(calls.map((call) => call.args[0]), ["outline", "blocks"]);
@@ -99,15 +134,46 @@ test("section occurrence disambiguates and invokes md section", async () => {
 	assert.deepEqual(calls[2]?.args, ["section", "--json", "--occurrence", "2", "Alpha", "/work/doc.md"]);
 });
 
-test("setTask mutates in place with structural loc and status", async () => {
-	const { runtime, calls } = fakeRuntime((request) =>
-		execution(request, JSON.stringify({ schema_version: "mdtools.v1", command: "SetTask", changed: true })),
-	);
+test("setTask preflights current tasks, then mutates in place with structural loc and status", async () => {
+	const { runtime, calls } = fakeRuntime((request) => {
+		if (request.args[0] === "tasks") return execution(request, JSON.stringify(tasksJson));
+		return execution(request, JSON.stringify({ schema_version: "mdtools.v1", command: "SetTask", changed: true }));
+	});
 
 	const result = await runtime.setTask({ file: "doc.md", loc: "2.0", status: "done" });
 
 	assert.equal(result.status, "ok");
-	assert.deepEqual(calls[0]?.args, ["set-task", "--json", "--status", "done", "-i", "2.0", "/work/doc.md"]);
+	assert.deepEqual(calls.map((call) => call.args[0]), ["tasks", "set-task"]);
+	assert.deepEqual(calls[1]?.args, ["set-task", "--json", "--status", "done", "-i", "2.0", "/work/doc.md"]);
+});
+
+test("setTask returns current task candidates for a stale loc", async () => {
+	const { runtime, calls } = fakeRuntime((request) => {
+		if (request.args[0] === "tasks") return execution(request, JSON.stringify(tasksJson));
+		return execution(request, JSON.stringify({ schema_version: "mdtools.v1", command: "SetTask", changed: true }));
+	});
+
+	const result = await runtime.setTask({ file: "doc.md", loc: "99.0", status: "done" });
+
+	assert.equal(result.status, "failed");
+	assert.equal(result.error?.code, "E_BAD_LOC");
+	assert.match(result.error?.nextAction ?? "", /md_tasks/);
+	assert.equal(result.candidates?.[0]?.loc, "2.0");
+	assert.equal(result.candidates?.[0]?.heading, "Beta");
+	assert.deepEqual(calls.map((call) => call.args[0]), ["tasks"]);
+});
+
+test("setTask reports schema mismatch when task preflight has unexpected shape", async () => {
+	const { runtime, calls } = fakeRuntime((request) => {
+		if (request.args[0] === "tasks") return execution(request, JSON.stringify({ schema_version: "mdtools.v1", results: [{ file: "/work/doc.md" }] }));
+		return execution(request, JSON.stringify({ schema_version: "mdtools.v1", command: "SetTask", changed: true }));
+	});
+
+	const result = await runtime.setTask({ file: "doc.md", loc: "2.0", status: "done" });
+
+	assert.equal(result.status, "failed");
+	assert.equal(result.error?.code, "E_MD_SCHEMA_MISMATCH");
+	assert.deepEqual(calls.map((call) => call.args[0]), ["tasks"]);
 });
 
 test("replaceSection fails closed on expectEtag mismatch", async () => {
@@ -120,7 +186,9 @@ test("replaceSection fails closed on expectEtag mismatch", async () => {
 	const result = await runtime.replaceSection({ file: "doc.md", heading: "Beta", content: "## Beta\nnew", expectEtag: "stale" });
 
 	assert.equal(result.status, "failed");
+	assert.equal(result.error?.code, "E_ETAG_MISMATCH");
 	assert.match(result.error?.message ?? "", /etag mismatch/);
+	assert.match(result.error?.nextAction ?? "", /md_blocks/);
 	assert.deepEqual(calls.map((call) => call.args[0]), ["outline", "blocks"]);
 });
 

@@ -3,6 +3,19 @@ export type TaskStatus = "pending" | "done";
 export type MovePlacement = "after" | "before" | "into";
 export type SectionLeveling = "auto" | "keep";
 
+export type MdErrorCode =
+	| "E_MD_BINARY_MISSING"
+	| "E_MD_COMMAND_ABORTED"
+	| "E_MD_COMMAND_FAILED"
+	| "E_MD_JSON_PARSE"
+	| "E_MD_SCHEMA_MISMATCH"
+	| "E_ETAG_MISMATCH"
+	| "E_ETAG_UNAVAILABLE"
+	| "E_HEADING_NOT_FOUND"
+	| "E_AMBIGUOUS_HEADING"
+	| "E_OCCURRENCE_OUT_OF_RANGE"
+	| "E_BAD_LOC";
+
 export interface MdCommandRequest {
 	binary: string;
 	args: string[];
@@ -36,19 +49,24 @@ export interface MdtoolsStatus {
 }
 
 export interface MdErrorInfo {
+	code: MdErrorCode;
 	message: string;
+	nextAction: string;
 	exitCode?: number | null;
 	stderr?: string;
 	hint?: string;
 }
 
 export interface MdCandidate {
-	role?: "target" | "source" | "destination";
+	role?: "target" | "source" | "destination" | "task";
 	heading?: string;
 	occurrence?: number;
 	level?: number;
 	blockIndex?: number;
 	etag?: string;
+	loc?: string;
+	status?: TaskStatus;
+	taskIndex?: number;
 	span?: unknown;
 	snippet?: string;
 }
@@ -61,15 +79,31 @@ export interface MdResultMeta {
 	fullOutputPath?: string;
 }
 
-export interface MdResultEnvelope<TData = unknown> {
-	status: MdToolStatus;
+interface MdResultBase {
 	command: string;
 	file?: string;
-	data?: TData;
-	candidates?: MdCandidate[];
-	error?: MdErrorInfo;
 	meta: MdResultMeta;
 }
+
+export type MdResultEnvelope<TData = unknown> =
+	| (MdResultBase & {
+			status: "ok";
+			data?: TData;
+			candidates?: never;
+			error?: never;
+	  })
+	| (MdResultBase & {
+			status: "ambiguous";
+			candidates?: MdCandidate[];
+			error: MdErrorInfo;
+			data?: never;
+	  })
+	| (MdResultBase & {
+			status: "failed";
+			candidates?: MdCandidate[];
+			error: MdErrorInfo;
+			data?: never;
+	  });
 
 export interface OutlineParams {
 	file: string;
