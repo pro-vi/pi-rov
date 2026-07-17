@@ -2,7 +2,7 @@
 title: pi-mdtools v0.2 — binary-owned contract
 objective: Make weak-model markdown editing in pi trustworthy by moving matching, ambiguity, and error semantics into the md binary, so the TS adapter can never disagree with the tool it wraps.
 type: feat
-status: active
+status: completed
 date: 2026-07-17
 origin: mdtools session 2026-07-17 — representation-integrity audit of pi-mdtools + pi extension-pattern and integration-point exploration; supersedes the error-mapping decisions of docs/plans/2026-07-11-001-feat-mdtools-protocol-hardening-plan.md (completed)
 ---
