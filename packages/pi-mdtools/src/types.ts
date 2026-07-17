@@ -14,7 +14,19 @@ export type MdErrorCode =
 	| "E_HEADING_NOT_FOUND"
 	| "E_AMBIGUOUS_HEADING"
 	| "E_OCCURRENCE_OUT_OF_RANGE"
+	| "E_ETAG_AMBIGUOUS"
+	| "E_MD_VERSION_UNSUPPORTED"
 	| "E_BAD_LOC";
+
+/// Handshake verdict from probing `md schema --json` once per runtime.
+/// "current" requires schema_version mdtools.v1 AND the required capability
+/// set; a version match with a missing capability is "legacy".
+export interface MdHandshake {
+	verdict: "current" | "legacy" | "missing";
+	binaryVersion?: string;
+	capabilities?: string[];
+	schemaVersion?: string;
+}
 
 export interface MdCommandRequest {
 	binary: string;
@@ -46,6 +58,7 @@ export interface MdBinaryResolution {
 export interface MdtoolsStatus {
 	binary: MdBinaryResolution;
 	cwd: string;
+	handshake?: MdHandshake;
 }
 
 export interface MdErrorInfo {
@@ -63,6 +76,7 @@ export interface MdCandidate {
 	occurrence?: number;
 	level?: number;
 	blockIndex?: number;
+	line?: number;
 	etag?: string;
 	loc?: string;
 	status?: TaskStatus;
@@ -141,6 +155,7 @@ export interface SetTaskParams {
 	file: string;
 	loc: string;
 	status: TaskStatus;
+	expectEtag?: string;
 }
 
 export interface MoveSectionParams {

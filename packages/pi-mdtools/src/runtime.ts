@@ -25,6 +25,9 @@ import type {
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+/// Primary override, plus the originally-shipped name kept as a
+/// compatibility alias so existing installs keep working.
+const MDTOOLS_ENV_BIN_PRIMARY = "MD_BINARY_PATH";
 const MDTOOLS_ENV_BIN = "MDTOOLS_MD_BIN";
 
 interface RuntimeOptions {
@@ -48,47 +51,126 @@ interface RunJsonFailure {
 
 type RunJsonOutcome = RunJsonSuccess | RunJsonFailure;
 
-interface HeadingCandidate extends MdCandidate {
-	heading: string;
-	occurrence: number;
-	blockIndex: number;
+export const MDTOOLS_SCHEMA_VERSION = "mdtools.v1";
+
+/// Capabilities the handshake requires before the binary counts as
+/// "current". A version match without these is "legacy".
+export const REQUIRED_CAPABILITIES = ["error_envelope", "section_etag"] as const;
+
+/// Total mapping from the binary's serialized DiagnosticCode to the adapter
+/// error code. Exported so the parity suite can prove totality against
+/// `md schema --json`'s diagnostic_codes list. An unmapped code at runtime
+/// falls back to E_MD_COMMAND_FAILED with the raw code kept visible in the
+/// message — never silently.
+export const DIAGNOSTIC_TO_ERROR_CODE: Record<string, MdErrorCode> = {
+	io_open_failed: "E_MD_COMMAND_FAILED",
+	parse_failed: "E_MD_COMMAND_FAILED",
+	frontmatter_parse_failed: "E_MD_COMMAND_FAILED",
+	heading_not_found: "E_HEADING_NOT_FOUND",
+	occurrence_out_of_range: "E_OCCURRENCE_OUT_OF_RANGE",
+	block_index_out_of_range: "E_MD_COMMAND_FAILED",
+	duplicate_heading_match: "E_AMBIGUOUS_HEADING",
+	invalid_selector: "E_MD_COMMAND_FAILED",
+	invalid_utf8_on_stdin: "E_MD_COMMAND_FAILED",
+	invalid_key_path: "E_MD_COMMAND_FAILED",
+	frontmatter_field_conflict: "E_MD_COMMAND_FAILED",
+	no_tables_in_document: "E_MD_COMMAND_FAILED",
+	table_not_a_table: "E_MD_COMMAND_FAILED",
+	column_not_found: "E_MD_COMMAND_FAILED",
+	table_row_not_found: "E_MD_COMMAND_FAILED",
+	invalid_table_row: "E_MD_COMMAND_FAILED",
+	task_item_not_found: "E_BAD_LOC",
+	not_a_task_list: "E_BAD_LOC",
+	invalid_task_loc: "E_BAD_LOC",
+	etag_mismatch: "E_ETAG_MISMATCH",
+	etag_ambiguous: "E_ETAG_AMBIGUOUS",
+	multi_file_failure: "E_MD_COMMAND_FAILED",
+};
+
+/// Decoded projection of the binary's structured error envelope. The adapter
+/// NEVER re-derives any of this from stderr prose or exit codes when an
+/// envelope is present — the binary owns matching and error semantics.
+interface DecodedBinaryError {
+	diagnosticCode: string;
+	errorCode: MdErrorCode;
+	status: "ambiguous" | "failed";
+	message: string;
+	hint?: string;
+	role?: "target" | "source" | "destination";
+	requestedOccurrence?: number;
+	totalMatches?: number;
+	matches?: Array<{ blockIndex: number; occurrence: number; line: number }>;
+	expectedEtag?: string;
+	foundEtag?: string;
+	loc?: string;
+	schemaVersionOk: boolean;
 }
 
-interface HeadingLookupSuccess {
-	ok: true;
-	candidates: HeadingCandidate[];
+function decodeBinaryErrorEnvelope(stdout: string): DecodedBinaryError | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(stdout);
+	} catch {
+		return undefined;
+	}
+	if (!isRecord(parsed) || !isRecord(parsed.error)) return undefined;
+	const err = parsed.error;
+	const diagnosticCode = stringValue(err.code);
+	const message = stringValue(err.message);
+	if (diagnosticCode === undefined || message === undefined) return undefined;
+
+	const errorCode = DIAGNOSTIC_TO_ERROR_CODE[diagnosticCode] ?? "E_MD_COMMAND_FAILED";
+	const status: "ambiguous" | "failed" =
+		diagnosticCode === "duplicate_heading_match" || diagnosticCode === "etag_ambiguous" ? "ambiguous" : "failed";
+
+	const decoded: DecodedBinaryError = {
+		diagnosticCode,
+		errorCode,
+		status,
+		message: DIAGNOSTIC_TO_ERROR_CODE[diagnosticCode] !== undefined ? message : `${message} (unmapped md diagnostic: ${diagnosticCode})`,
+		schemaVersionOk: parsed.schema_version === MDTOOLS_SCHEMA_VERSION,
+	};
+	const hint = stringValue(err.hint);
+	if (hint !== undefined) decoded.hint = hint;
+
+	const context = err.context;
+	if (isRecord(context)) {
+		const role = stringValue(context.role);
+		if (role === "target" || role === "source" || role === "destination") decoded.role = role;
+		const requested = integerValue(context.requested_occurrence, { min: 1 });
+		if (requested !== undefined) decoded.requestedOccurrence = requested;
+		const total = integerValue(context.total_matches, { min: 0 });
+		if (total !== undefined) decoded.totalMatches = total;
+		if (Array.isArray(context.matches)) {
+			const matches: Array<{ blockIndex: number; occurrence: number; line: number }> = [];
+			for (const m of context.matches) {
+				if (!isRecord(m)) continue;
+				const blockIndex = integerValue(m.block_index, { min: 0 });
+				const occurrence = integerValue(m.occurrence, { min: 1 });
+				const line = integerValue(m.line, { min: 1 });
+				if (blockIndex !== undefined && occurrence !== undefined && line !== undefined) {
+					matches.push({ blockIndex, occurrence, line });
+				}
+			}
+			if (matches.length > 0) decoded.matches = matches;
+		}
+		const expectedEtag = stringValue(context.expected_etag);
+		if (expectedEtag !== undefined) decoded.expectedEtag = expectedEtag;
+		const foundEtag = stringValue(context.found_etag);
+		if (foundEtag !== undefined) decoded.foundEtag = foundEtag;
+		const loc = stringValue(context.loc);
+		if (loc !== undefined) decoded.loc = loc;
+	}
+	return decoded;
 }
 
-interface HeadingLookupFailure {
-	ok: false;
-	result: MdResultEnvelope;
+/// The flag the model should pass to disambiguate, given the failed role.
+function occurrenceParamForRole(role: "target" | "source" | "destination" | undefined): string {
+	if (role === "source") return "sourceOccurrence";
+	if (role === "destination") return "destinationOccurrence";
+	return "occurrence";
 }
 
-type HeadingLookupOutcome = HeadingLookupSuccess | HeadingLookupFailure;
-
-interface HeadingSearchContext {
-	entries: unknown[];
-	etagByBlock: Map<number, string>;
-}
-
-interface HeadingContextSuccess {
-	ok: true;
-	context: HeadingSearchContext;
-}
-
-type HeadingContextOutcome = HeadingContextSuccess | HeadingLookupFailure;
-
-interface TaskLookupSuccess {
-	ok: true;
-	candidates: MdCandidate[];
-}
-
-interface TaskLookupFailure {
-	ok: false;
-	result: MdResultEnvelope;
-}
-
-type TaskLookupOutcome = TaskLookupSuccess | TaskLookupFailure;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -139,7 +221,8 @@ function unresolvedMeta(args: string[], cwd: string): MdResultEnvelope["meta"] {
 
 const DEFAULT_NEXT_ACTIONS: Record<MdErrorCode, string> = {
 	E_MD_BINARY_MISSING: "Install mdtools so `md` is on PATH, or set MDTOOLS_MD_BIN to the md executable path, then retry.",
-	E_MD_COMMAND_ABORTED: "Retry the mdtools call; if it times out again, narrow the file or inspect the md binary directly.",
+	E_MD_COMMAND_ABORTED:
+		"The command was aborted mid-flight and the mutation MAY have committed (atomic, never partial). Re-read the file with md_outline or md_tasks before any retry.",
 	E_MD_COMMAND_FAILED: "Read error.stderr for the mdtools failure, refresh the structural target with the relevant md_* read tool, then retry.",
 	E_MD_JSON_PARSE: "Run /mdtools status to confirm the md binary, then retry or inspect the md command output outside Pi.",
 	E_MD_SCHEMA_MISMATCH: "Upgrade mdtools or re-run the matching md_* read tool; the installed md JSON shape did not match pi-mdtools expectations.",
@@ -149,6 +232,10 @@ const DEFAULT_NEXT_ACTIONS: Record<MdErrorCode, string> = {
 	E_AMBIGUOUS_HEADING: "Choose one candidates[].occurrence value and retry with occurrence, sourceOccurrence, or destinationOccurrence as appropriate.",
 	E_OCCURRENCE_OUT_OF_RANGE: "Choose an occurrence value from candidates[] and retry.",
 	E_BAD_LOC: "Run md_tasks for current task locs, choose one candidates[].loc value, then retry md_set_task.",
+	E_ETAG_AMBIGUOUS:
+		"Multiple identical targets share this etag, so the guard cannot prove identity. Re-query and target one explicitly by occurrence/index, or edit one duplicate first.",
+	E_MD_VERSION_UNSUPPORTED:
+		"The installed md binary predates the structured error contract. Upgrade mdtools (cargo install --path <mdtools-repo> or reinstall from a release), then retry.",
 };
 
 function mdError(
@@ -267,11 +354,13 @@ export async function resolveMdBinary(options: {
 		if (resolved !== undefined) return { found: true, path: resolved, source: "explicit", searched };
 	}
 
-	const envBin = env[MDTOOLS_ENV_BIN];
-	if (envBin !== undefined && envBin.trim() !== "") {
-		const resolved = await resolveNamedBinary(envBin.trim(), env, options.cwd);
-		searched.push(envBin.trim());
-		if (resolved !== undefined) return { found: true, path: resolved, source: "env", searched };
+	for (const envName of [MDTOOLS_ENV_BIN_PRIMARY, MDTOOLS_ENV_BIN]) {
+		const envBin = env[envName];
+		if (envBin !== undefined && envBin.trim() !== "") {
+			const resolved = await resolveNamedBinary(envBin.trim(), env, options.cwd);
+			searched.push(envBin.trim());
+			if (resolved !== undefined) return { found: true, path: resolved, source: "env", searched };
+		}
 	}
 
 	const pathEntries = (env.PATH ?? "").split(delimiter).filter((entry) => entry.length > 0);
@@ -363,14 +452,6 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 	});
 };
 
-function classifyFailureStatus(stderr: string): "ambiguous" | "failed" {
-	const normalized = stderr.toLowerCase();
-	if (normalized.includes("ambiguous") || normalized.includes("multiple") || normalized.includes("more than one")) {
-		return "ambiguous";
-	}
-	return "failed";
-}
-
 function errorMessage(execution: MdCommandExecution): string {
 	const stderr = execution.stderr.trim();
 	if (stderr.length > 0) return stderr.split("\n")[0] ?? stderr;
@@ -378,17 +459,23 @@ function errorMessage(execution: MdCommandExecution): string {
 	return `md exited with code ${execution.code ?? "unknown"}`;
 }
 
-function resultFromExecutionFailure(command: string, file: string | undefined, execution: MdCommandExecution): MdResultEnvelope {
-	const status = classifyFailureStatus(execution.stderr);
+/// Failure shaping when NO structured envelope is present on stdout. This is
+/// the legacy-binary path only: no stderr sniffing, no exit-code guessing —
+/// a conflict-class exit on a legacy binary maps to an explicit
+/// upgrade-required code rather than a fabricated etag/ambiguity story.
+function legacyFailureResult(
+	command: string,
+	file: string | undefined,
+	execution: MdCommandExecution,
+	legacyBinary: boolean,
+): MdResultEnvelope {
 	const code: MdErrorCode = execution.killed
 		? "E_MD_COMMAND_ABORTED"
-		: execution.code === 4
-			? "E_ETAG_MISMATCH"
-			: status === "ambiguous"
-				? "E_AMBIGUOUS_HEADING"
-				: "E_MD_COMMAND_FAILED";
+		: legacyBinary && execution.code === 4
+			? "E_MD_VERSION_UNSUPPORTED"
+			: "E_MD_COMMAND_FAILED";
 	return resultWithError({
-		status,
+		status: "failed",
 		command,
 		...(file !== undefined ? { file } : {}),
 		meta: commandMeta(command, file, execution),
@@ -396,9 +483,6 @@ function resultFromExecutionFailure(command: string, file: string | undefined, e
 		message: errorMessage(execution),
 		exitCode: execution.code,
 		...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
-		...(execution.code === 4
-			? { hint: "Re-read the target with md_blocks or md_block to refresh current indices and etags, then retry." }
-			: {}),
 	});
 }
 
@@ -416,49 +500,36 @@ function parseJsonObject(stdout: string): { ok: true; data: Record<string, unkno
 	return { ok: true, data: parsed };
 }
 
-function headingMatches(actual: string, expected: string, ignoreCase: boolean | undefined): boolean {
-	return ignoreCase === true ? actual.toLocaleLowerCase() === expected.toLocaleLowerCase() : actual === expected;
-}
-
-function headingCandidateFromEntry(
-	entry: unknown,
-	searchedHeading: string,
-	ignoreCase: boolean | undefined,
-	occurrence: number,
-	etagByBlock: Map<number, string>,
-): HeadingCandidate | undefined {
-	if (!isRecord(entry)) return undefined;
-	const heading = entry.heading;
-	if (!isRecord(heading)) return undefined;
-	const text = stringValue(heading.text);
-	const blockIndex = integerValue(heading.block_index, { min: 0 });
-	if (text === undefined || blockIndex === undefined) return undefined;
-	if (!headingMatches(text, searchedHeading, ignoreCase)) return undefined;
-	const level = integerValue(heading.level, { min: 1, max: 6 });
-	const etag = etagByBlock.get(blockIndex);
-	return {
-		role: "target",
-		heading: text,
-		occurrence,
-		blockIndex,
-		...(level !== undefined ? { level } : {}),
-		...(etag !== undefined ? { etag } : {}),
-		...(heading.span !== undefined ? { span: heading.span } : {}),
-		snippet: `${"#".repeat(level ?? 1)} ${text}`,
-	};
-}
-
-function extractBlockEtags(blocksData: Record<string, unknown>): Map<number, string> {
-	const etags = new Map<number, string>();
-	const blocks = blocksData.blocks;
-	if (!Array.isArray(blocks)) return etags;
-	for (const block of blocks) {
-		if (!isRecord(block)) continue;
-		const index = integerValue(block.index, { min: 0 });
-		const etag = stringValue(block.etag);
-		if (index !== undefined && etag !== undefined) etags.set(index, etag);
+/// Pure PROJECTION of md outline entries into candidates: every heading,
+/// verbatim, with its section etag. No matching, no case folding — the
+/// adapter never decides whether a heading "matches"; that is the binary's
+/// job (ADR 0001 extended from parsing to matching).
+function headingListingFromOutline(
+	data: Record<string, unknown>,
+	role: "target" | "source" | "destination",
+): MdCandidate[] {
+	const entries = data.entries;
+	if (!Array.isArray(entries)) return [];
+	const candidates: MdCandidate[] = [];
+	for (const entry of entries) {
+		if (!isRecord(entry)) continue;
+		const heading = entry.heading;
+		if (!isRecord(heading)) continue;
+		const text = stringValue(heading.text);
+		const blockIndex = integerValue(heading.block_index, { min: 0 });
+		if (text === undefined || blockIndex === undefined) continue;
+		const level = integerValue(heading.level, { min: 1, max: 6 });
+		const etag = stringValue(entry.etag);
+		candidates.push({
+			role,
+			heading: text,
+			blockIndex,
+			...(level !== undefined ? { level } : {}),
+			...(etag !== undefined ? { etag } : {}),
+			snippet: `${"#".repeat(level ?? 1)} ${text}`,
+		});
 	}
-	return etags;
+	return candidates;
 }
 
 function taskCandidateFromEntry(entry: unknown): MdCandidate | undefined {
@@ -499,66 +570,6 @@ function taskCandidatesFromData(data: Record<string, unknown>): MdCandidate[] | 
 	return candidates;
 }
 
-function selectCandidate(
-	candidates: HeadingCandidate[],
-	occurrence: number | undefined,
-	command: string,
-	file: string,
-	args: string[],
-	cwd: string,
-	role: "source" | "destination" | "target" = "target",
-): { ok: true; candidate: HeadingCandidate } | { ok: false; result: MdResultEnvelope } {
-	const withRole = candidates.map((candidate) => ({ ...candidate, role }));
-	if (candidates.length === 0) {
-		return {
-			ok: false,
-			result: unresolvedResultWithError({
-				status: "failed",
-				command,
-				file,
-				args,
-				cwd,
-				code: "E_HEADING_NOT_FOUND",
-				message: `No ${role} heading matched.`,
-			}),
-		};
-	}
-	if (occurrence === undefined && candidates.length > 1) {
-		const occurrenceParam = role === "target" ? "occurrence" : `${role}Occurrence`;
-		return {
-			ok: false,
-			result: unresolvedResultWithError({
-				status: "ambiguous",
-				command,
-				file,
-				args,
-				cwd,
-				code: "E_AMBIGUOUS_HEADING",
-				message: `Multiple ${role} headings matched; pass ${occurrenceParam}.`,
-				candidates: withRole,
-				nextAction: `Choose one candidates[].occurrence value and retry with ${occurrenceParam}.`,
-			}),
-		};
-	}
-	const selectedOccurrence = occurrence ?? 1;
-	const candidate = candidates[selectedOccurrence - 1];
-	if (candidate === undefined) {
-		return {
-			ok: false,
-			result: unresolvedResultWithError({
-				status: "failed",
-				command,
-				file,
-				args,
-				cwd,
-				code: "E_OCCURRENCE_OUT_OF_RANGE",
-				message: `${role} occurrence ${selectedOccurrence} is out of range.`,
-				candidates: withRole,
-			}),
-		};
-	}
-	return { ok: true, candidate: { ...candidate, role } };
-}
 
 export class MdtoolsRuntime {
 	private readonly cwd: string;
@@ -575,10 +586,49 @@ export class MdtoolsRuntime {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	}
 
+	private handshakePromise: Promise<import("./types.js").MdHandshake> | undefined;
+
 	async status(): Promise<MdtoolsStatus> {
 		return {
 			binary: await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) }),
 			cwd: this.cwd,
+			handshake: await this.handshake(),
+		};
+	}
+
+	/// One-shot per runtime (the runtime is session-scoped): probe
+	/// `md schema --json`. "current" requires the schema version AND the
+	/// required capability set; version-match-with-missing-capability is
+	/// "legacy".
+	async handshake(): Promise<import("./types.js").MdHandshake> {
+		this.handshakePromise ??= this.probeHandshake();
+		return await this.handshakePromise;
+	}
+
+	private async probeHandshake(): Promise<import("./types.js").MdHandshake> {
+		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+		if (!resolution.found || resolution.path === undefined) return { verdict: "missing" };
+		const execution = await this.runner({
+			binary: resolution.path,
+			args: ["schema", "--json"],
+			cwd: this.cwd,
+			timeoutMs: this.timeoutMs,
+		});
+		if (execution.code !== 0) return { verdict: "legacy" };
+		const parsed = parseJsonObject(execution.stdout);
+		if (!parsed.ok) return { verdict: "legacy" };
+		const schemaVersion = stringValue(parsed.data.schema_version);
+		const binaryVersion = stringValue(parsed.data.binary_version);
+		const capabilities = Array.isArray(parsed.data.capabilities)
+			? parsed.data.capabilities.filter((c): c is string => typeof c === "string")
+			: [];
+		const current =
+			schemaVersion === MDTOOLS_SCHEMA_VERSION && REQUIRED_CAPABILITIES.every((cap) => capabilities.includes(cap));
+		return {
+			verdict: current ? "current" : "legacy",
+			...(binaryVersion !== undefined ? { binaryVersion } : {}),
+			...(schemaVersion !== undefined ? { schemaVersion } : {}),
+			capabilities,
 		};
 	}
 
@@ -590,10 +640,6 @@ export class MdtoolsRuntime {
 	async section(params: SectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.sectionArgs(params, file);
-		const candidates = await this.findHeadingCandidates("md_section", file, params.heading, params.ignoreCase, args, signal, true);
-		if (!candidates.ok) return candidates.result;
-		const selected = selectCandidate(candidates.candidates, params.occurrence, "md_section", file, args, this.cwd);
-		if (!selected.ok) return selected.result;
 		return await this.runJson("md_section", args, file, signal);
 	}
 
@@ -629,96 +675,39 @@ export class MdtoolsRuntime {
 
 	async setTask(params: SetTaskParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
-		const args = ["set-task", "--json", "--status", params.status, "-i", params.loc, file];
-		const taskCandidates = await this.findTaskCandidates("md_set_task", file, args, signal);
-		if (!taskCandidates.ok) return taskCandidates.result;
-		if (!taskCandidates.candidates.some((candidate) => candidate.loc === params.loc)) {
-			return unresolvedResultWithError({
-				status: "failed",
-				command: "md_set_task",
-				file,
-				args,
-				cwd: this.cwd,
-				code: "E_BAD_LOC",
-				message: `No current task matched loc ${params.loc}.`,
-				candidates: taskCandidates.candidates,
-			});
-		}
+		const args = ["set-task", "--json", "--status", params.status, "-i"];
+		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
+		args.push(params.loc, file);
 		return await this.runJson("md_set_task", args, file, signal);
 	}
 
 	async moveSection(params: MoveSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
-		const headingContext = await this.loadHeadingSearchContext("md_move_section", file, args, signal, true);
-		if (!headingContext.ok) return headingContext.result;
-
-		const selectedSource = selectCandidate(
-			this.headingCandidatesFromContext(headingContext.context, params.source, params.ignoreCase),
-			params.sourceOccurrence,
-			"md_move_section",
-			file,
-			args,
-			this.cwd,
-			"source",
-		);
-		if (!selectedSource.ok) return selectedSource.result;
-
-		const selectedDestination = selectCandidate(
-			this.headingCandidatesFromContext(headingContext.context, params.destination, params.ignoreCase),
-			params.destinationOccurrence,
-			"md_move_section",
-			file,
-			args,
-			this.cwd,
-			"destination",
-		);
-		if (!selectedDestination.ok) return selectedDestination.result;
-
 		return await this.runJson("md_move_section", args, file, signal);
 	}
 
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
-		const args = this.replaceSectionArgs(params, file, "<tempfile>");
-		const candidates = await this.findHeadingCandidates("md_replace_section", file, params.heading, params.ignoreCase, args, signal, true);
-		if (!candidates.ok) return candidates.result;
-		const selected = selectCandidate(candidates.candidates, params.occurrence, "md_replace_section", file, args, this.cwd);
-		if (!selected.ok) return selected.result;
-
-		if (params.expectEtag !== undefined) {
-			if (selected.candidate.etag === undefined) {
-				return unresolvedResultWithError({
-					status: "failed",
-					command: "md_replace_section",
-					file,
-					args,
-					cwd: this.cwd,
-					code: "E_ETAG_UNAVAILABLE",
-					message: "Cannot verify expectEtag because md_blocks did not return etags.",
-					candidates: [selected.candidate],
-					hint: "Upgrade mdtools to a version whose md blocks --json includes per-block etag fields.",
-				});
-			}
-			if (selected.candidate.etag !== params.expectEtag) {
-				return unresolvedResultWithError({
-					status: "failed",
-					command: "md_replace_section",
-					file,
-					args,
-					cwd: this.cwd,
-					code: "E_ETAG_MISMATCH",
-					message: `Heading block etag mismatch: expected ${params.expectEtag}, found ${selected.candidate.etag}.`,
-					candidates: [selected.candidate],
-					hint: "Re-read md_blocks for current etags, then retry with the fresh expectEtag.",
-				});
-			}
-		}
-
+		// expectEtag passes straight through to the binary's --expect-etag:
+		// a real section-span guard verified in-process by md (atomic with
+		// the splice), replacing the old TS heading-block compare that was
+		// both weaker (heading line only) and racy (separate process).
 		const tempDir = await mkdtemp(join(tmpdir(), "pi-mdtools-"));
 		const contentPath = join(tempDir, "section.md");
 		try {
 			await writeFile(contentPath, params.content, "utf8");
+			if (signal?.aborted) {
+				return unresolvedResultWithError({
+					status: "failed",
+					command: "md_replace_section",
+					file,
+					args: [],
+					cwd: this.cwd,
+					code: "E_MD_COMMAND_ABORTED",
+					message: "Aborted before the md command started; the file is untouched.",
+				});
+			}
 			const realArgs = this.replaceSectionArgs(params, file, contentPath);
 			return await this.runJson("md_replace_section", realArgs, file, signal);
 		} finally {
@@ -749,100 +738,28 @@ export class MdtoolsRuntime {
 		const args = ["replace-section", "--json", "-i", "--from", contentPath];
 		if (params.ignoreCase === true) args.push("--ignore-case");
 		if (params.occurrence !== undefined) args.push("--occurrence", String(params.occurrence));
+		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
 		args.push(params.heading, file);
 		return args;
 	}
 
-	private async findHeadingCandidates(
-		command: string,
-		file: string,
-		heading: string,
-		ignoreCase: boolean | undefined,
-		originalArgs: string[],
-		signal: AbortSignal | undefined,
-		includeEtags: boolean,
-	): Promise<HeadingLookupOutcome> {
-		const context = await this.loadHeadingSearchContext(command, file, originalArgs, signal, includeEtags);
-		if (!context.ok) return context;
-		return { ok: true, candidates: this.headingCandidatesFromContext(context.context, heading, ignoreCase) };
-	}
-
-	private async loadHeadingSearchContext(
-		command: string,
-		file: string,
-		originalArgs: string[],
-		signal: AbortSignal | undefined,
-		includeEtags: boolean,
-	): Promise<HeadingContextOutcome> {
-		const outline = await this.runJsonData("md_outline", ["outline", "--json", file], file, signal);
-		if (!outline.ok) return { ok: false, result: { ...outline.result, command, meta: unresolvedMeta(originalArgs, this.cwd) } };
-
-		let etagByBlock = new Map<number, string>();
-		if (includeEtags) {
-			const blocks = await this.runJsonData("md_blocks", ["blocks", "--json", file], file, signal);
-			if (blocks.ok) etagByBlock = extractBlockEtags(blocks.data);
-		}
-
-		const entries = outline.data.entries;
-		if (!Array.isArray(entries)) {
-			return {
-				ok: false,
-				result: unresolvedResultWithError({
-					status: "failed",
-					command,
-					file,
-					args: originalArgs,
-					cwd: this.cwd,
-					code: "E_MD_SCHEMA_MISMATCH",
-					message: "md outline JSON did not contain an entries array.",
-				}),
-			};
-		}
-
-		return { ok: true, context: { entries, etagByBlock } };
-	}
-
-	private headingCandidatesFromContext(
-		context: HeadingSearchContext,
-		heading: string,
-		ignoreCase: boolean | undefined,
-	): HeadingCandidate[] {
-		const candidates: HeadingCandidate[] = [];
-		let occurrence = 1;
-		for (const entry of context.entries) {
-			const candidate = headingCandidateFromEntry(entry, heading, ignoreCase, occurrence, context.etagByBlock);
-			if (candidate !== undefined) {
-				candidates.push(candidate);
-				occurrence += 1;
-			}
-		}
-		return candidates;
-	}
-
-	private async findTaskCandidates(
-		command: string,
-		file: string,
-		originalArgs: string[],
-		signal: AbortSignal | undefined,
-	): Promise<TaskLookupOutcome> {
-		const tasks = await this.runJsonData("md_tasks", ["tasks", "--json", file], file, signal);
-		if (!tasks.ok) return { ok: false, result: { ...tasks.result, command, meta: unresolvedMeta(originalArgs, this.cwd) } };
-		const candidates = taskCandidatesFromData(tasks.data);
-		if (candidates === undefined) {
-			return {
-				ok: false,
-				result: unresolvedResultWithError({
-					status: "failed",
-					command,
-					file,
-					args: originalArgs,
-					cwd: this.cwd,
-					code: "E_MD_SCHEMA_MISMATCH",
-					message: "md tasks JSON did not contain a results array.",
-				}),
-			};
-		}
-		return { ok: true, candidates };
+	/// Best-effort structural read for failure-candidate enrichment. Raw
+	/// runner + parse; any failure returns undefined (never recursive, never
+	/// masks the original error).
+	private async tryReadJson(args: string[], signal: AbortSignal | undefined): Promise<Record<string, unknown> | undefined> {
+		if (signal?.aborted) return undefined;
+		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+		if (!resolution.found || resolution.path === undefined) return undefined;
+		const execution = await this.runner({
+			binary: resolution.path,
+			args,
+			cwd: this.cwd,
+			timeoutMs: this.timeoutMs,
+			...(signal !== undefined ? { signal } : {}),
+		});
+		if (execution.killed || execution.code !== 0) return undefined;
+		const parsed = parseJsonObject(execution.stdout);
+		return parsed.ok ? parsed.data : undefined;
 	}
 
 	private async runJson(
@@ -892,11 +809,8 @@ export class MdtoolsRuntime {
 			timeoutMs: this.timeoutMs,
 			...(signal !== undefined ? { signal } : {}),
 		});
-		if (execution.killed) {
-			return { ok: false, result: resultFromExecutionFailure(command, file, execution) };
-		}
-		if (execution.code !== 0) {
-			return { ok: false, result: resultFromExecutionFailure(command, file, execution) };
+		if (execution.killed || execution.code !== 0) {
+			return { ok: false, result: await this.failureResult(command, file, execution, signal) };
 		}
 
 		const parsed = parseJsonObject(execution.stdout);
@@ -914,6 +828,94 @@ export class MdtoolsRuntime {
 			};
 		}
 
+		// Version-gate the boundary before any field decode: the one token
+		// designed to fail fast on a shape change must actually be read.
+		const schemaVersion = parsed.data.schema_version;
+		if (schemaVersion !== MDTOOLS_SCHEMA_VERSION) {
+			return {
+				ok: false,
+				result: resultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					meta: commandMeta(command, file, execution),
+					code: "E_MD_SCHEMA_MISMATCH",
+					message: `md returned schema_version ${JSON.stringify(schemaVersion ?? null)}; pi-mdtools requires ${MDTOOLS_SCHEMA_VERSION}.`,
+				}),
+			};
+		}
+
 		return { ok: true, data: parsed.data, execution };
+	}
+
+	/// Shape a nonzero-exit execution into the recovery envelope. The
+	/// binary's structured error envelope is authoritative; the adapter only
+	/// projects it (and enriches candidates with best-effort listings). No
+	/// envelope means abort, or a legacy binary.
+	private async failureResult(
+		command: string,
+		file: string | undefined,
+		execution: MdCommandExecution,
+		signal: AbortSignal | undefined,
+	): Promise<MdResultEnvelope> {
+		if (execution.killed) {
+			return legacyFailureResult(command, file, execution, false);
+		}
+		const decoded = decodeBinaryErrorEnvelope(execution.stdout);
+		if (decoded === undefined) {
+			const handshake = await this.handshake();
+			return legacyFailureResult(command, file, execution, handshake.verdict !== "current");
+		}
+		if (!decoded.schemaVersionOk) {
+			return resultWithError({
+				status: "failed",
+				command,
+				...(file !== undefined ? { file } : {}),
+				meta: commandMeta(command, file, execution),
+				code: "E_MD_SCHEMA_MISMATCH",
+				message: `md error envelope carried an unexpected schema_version; pi-mdtools requires ${MDTOOLS_SCHEMA_VERSION}.`,
+				exitCode: execution.code,
+			});
+		}
+
+		const role = decoded.role ?? "target";
+		let candidates: MdCandidate[] | undefined;
+		if (decoded.matches !== undefined) {
+			candidates = decoded.matches.map((m) => ({
+				role,
+				occurrence: m.occurrence,
+				blockIndex: m.blockIndex,
+				line: m.line,
+			}));
+		} else if (decoded.errorCode === "E_HEADING_NOT_FOUND" && file !== undefined) {
+			const outline = await this.tryReadJson(["outline", "--json", file], signal);
+			if (outline !== undefined) candidates = headingListingFromOutline(outline, role);
+		} else if (decoded.errorCode === "E_BAD_LOC" && file !== undefined) {
+			const tasks = await this.tryReadJson(["tasks", "--json", file], signal);
+			if (tasks !== undefined) {
+				const taskCandidates = taskCandidatesFromData(tasks);
+				if (taskCandidates !== undefined) candidates = taskCandidates;
+			}
+		}
+
+		const occurrenceParam = occurrenceParamForRole(decoded.role);
+		let nextAction: string | undefined;
+		if (decoded.errorCode === "E_AMBIGUOUS_HEADING" || decoded.errorCode === "E_OCCURRENCE_OUT_OF_RANGE") {
+			nextAction = `Choose one candidates[].occurrence value and retry with ${occurrenceParam}.`;
+		}
+
+		return resultWithError({
+			status: decoded.status,
+			command,
+			...(file !== undefined ? { file } : {}),
+			meta: commandMeta(command, file, execution),
+			code: decoded.errorCode,
+			message: decoded.message,
+			exitCode: execution.code,
+			...(candidates !== undefined && candidates.length > 0 ? { candidates } : {}),
+			...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
+			...(decoded.hint !== undefined ? { hint: decoded.hint } : {}),
+			...(nextAction !== undefined ? { nextAction } : {}),
+		});
 	}
 }
