@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 
 import type {
 	BlockParams,
+	MdHandshake,
 	BlocksParams,
 	MdBinaryResolution,
 	MdCandidate,
@@ -28,7 +29,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 /// Primary override, plus the originally-shipped name kept as a
 /// compatibility alias so existing installs keep working.
 const MDTOOLS_ENV_BIN_PRIMARY = "MD_BINARY_PATH";
-const MDTOOLS_ENV_BIN = "MDTOOLS_MD_BIN";
+const MDTOOLS_ENV_BIN_ALIAS = "MDTOOLS_MD_BIN";
 
 interface RuntimeOptions {
 	cwd: string;
@@ -354,7 +355,7 @@ export async function resolveMdBinary(options: {
 		if (resolved !== undefined) return { found: true, path: resolved, source: "explicit", searched };
 	}
 
-	for (const envName of [MDTOOLS_ENV_BIN_PRIMARY, MDTOOLS_ENV_BIN]) {
+	for (const envName of [MDTOOLS_ENV_BIN_PRIMARY, MDTOOLS_ENV_BIN_ALIAS]) {
 		const envBin = env[envName];
 		if (envBin !== undefined && envBin.trim() !== "") {
 			const resolved = await resolveNamedBinary(envBin.trim(), env, options.cwd);
@@ -586,7 +587,7 @@ export class MdtoolsRuntime {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	}
 
-	private handshakePromise: Promise<import("./types.js").MdHandshake> | undefined;
+	private handshakePromise: Promise<MdHandshake> | undefined;
 
 	async status(): Promise<MdtoolsStatus> {
 		return {
@@ -600,12 +601,12 @@ export class MdtoolsRuntime {
 	/// `md schema --json`. "current" requires the schema version AND the
 	/// required capability set; version-match-with-missing-capability is
 	/// "legacy".
-	async handshake(): Promise<import("./types.js").MdHandshake> {
+	async handshake(): Promise<MdHandshake> {
 		this.handshakePromise ??= this.probeHandshake();
 		return await this.handshakePromise;
 	}
 
-	private async probeHandshake(): Promise<import("./types.js").MdHandshake> {
+	private async probeHandshake(): Promise<MdHandshake> {
 		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
 		if (!resolution.found || resolution.path === undefined) return { verdict: "missing" };
 		const execution = await this.runner({

@@ -184,3 +184,31 @@ test("parity: behavioral roundtrips hit the exact adapter codes", { skip: !enabl
 	assert.equal((result.data as { guarded?: boolean })?.guarded, true);
 	assert.equal((result.data as { changed?: boolean })?.changed, true);
 });
+
+test("parity: TOOL_KIND matches md schema's per-command kind", { skip: !enabled }, async () => {
+	const { TOOL_KIND } = await import("../src/usage.js");
+	const schema = realSchema();
+	const kindByCommand = new Map<string, string>();
+	for (const c of schema.commands as Array<{ name: string; kind: string }>) {
+		kindByCommand.set(c.name, c.kind);
+	}
+	// md_* tool -> md subcommand it wraps
+	const wraps: Record<string, string> = {
+		md_outline: "outline",
+		md_section: "section",
+		md_tasks: "tasks",
+		md_table: "table",
+		md_blocks: "blocks",
+		md_block: "block",
+		md_set_task: "set-task",
+		md_move_section: "move-section",
+		md_replace_section: "replace-section",
+	};
+	for (const [tool, subcommand] of Object.entries(wraps)) {
+		assert.equal(
+			TOOL_KIND[tool],
+			kindByCommand.get(subcommand),
+			`TOOL_KIND[${tool}] disagrees with md schema kind for ${subcommand}`,
+		);
+	}
+});

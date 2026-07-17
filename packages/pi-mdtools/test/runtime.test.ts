@@ -314,3 +314,34 @@ test("resolveToolPath strips @ and resolves against cwd", () => {
 	assert.equal(resolveToolPath("/work", "sub/doc.md"), "/work/sub/doc.md");
 	assert.equal(resolveToolPath("/work", "/abs/doc.md"), "/abs/doc.md");
 });
+
+test("binary resolution precedence: MD_BINARY_PATH > MDTOOLS_MD_BIN > PATH", async () => {
+	const { mkdtemp: makeTemp, writeFile: write, chmod } = await import("node:fs/promises");
+	const { tmpdir: osTmp } = await import("node:os");
+	const { resolveMdBinary } = await import("../src/runtime.js");
+	const dir = await makeTemp(join(osTmp(), "pi-mdtools-resolve-"));
+	const make = async (name: string) => {
+		const p = join(dir, name);
+		await write(p, "#!/bin/sh\nexit 0\n", "utf8");
+		await chmod(p, 0o755);
+		return p;
+	};
+	const primary = await make("md-primary");
+	const alias = await make("md-alias");
+	const pathDir = join(dir, "bin");
+	const { mkdir } = await import("node:fs/promises");
+	await mkdir(pathDir);
+	const onPath = join(pathDir, "md");
+	await write(onPath, "#!/bin/sh\nexit 0\n", "utf8");
+	await chmod(onPath, 0o755);
+
+	// both set: primary wins
+	let res = await resolveMdBinary({ cwd: dir, env: { MD_BINARY_PATH: primary, MDTOOLS_MD_BIN: alias, PATH: pathDir } });
+	assert.equal(res.path, primary);
+	// alias alone still resolves (compatibility)
+	res = await resolveMdBinary({ cwd: dir, env: { MDTOOLS_MD_BIN: alias, PATH: pathDir } });
+	assert.equal(res.path, alias);
+	// neither: PATH lookup
+	res = await resolveMdBinary({ cwd: dir, env: { PATH: pathDir } });
+	assert.equal(res.path, onPath);
+});
