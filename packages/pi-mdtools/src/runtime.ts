@@ -1173,12 +1173,16 @@ export class MdtoolsRuntime {
 			}
 		}
 
-		const occurrenceParam = occurrenceParamForRole(decoded.role);
-		// The binary's remediation is authoritative; the adapter only
-		// re-words occurrence advice into tool parameter names.
+		// The binary's remediation is authoritative; the adapter only re-words
+		// occurrence advice into tool parameter names, and ONLY for a
+		// recognized role. An unknown/absent role preserves the binary hint
+		// verbatim instead of fabricating target-flavored advice.
 		let nextAction: string | undefined = decoded.hint;
-		if (decoded.errorCode === "E_AMBIGUOUS_HEADING" || decoded.errorCode === "E_OCCURRENCE_OUT_OF_RANGE") {
-			nextAction = `Choose one candidates[].occurrence value and retry with ${occurrenceParam}.`;
+		if (
+			(decoded.errorCode === "E_AMBIGUOUS_HEADING" || decoded.errorCode === "E_OCCURRENCE_OUT_OF_RANGE") &&
+			decoded.role !== undefined
+		) {
+			nextAction = `Choose one candidates[].occurrence value and retry with ${occurrenceParamForRole(decoded.role)}.`;
 		}
 
 		const result = resultWithError({

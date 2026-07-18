@@ -349,6 +349,32 @@ test("mutation outcome: a valid v1 error envelope is a clean rejection", async (
 	assert.equal(result.error?.code, "E_ETAG_MISMATCH");
 });
 
+test("occurrence advice is rewritten to the role's Pi parameter (source)", async () => {
+	const stdout = envelope("duplicate_heading_match", {}, {
+		role: "source",
+		total_matches: 2,
+		matches: [
+			{ block_index: 0, occurrence: 1, line: 1 },
+			{ block_index: 2, occurrence: 2, line: 5 },
+		],
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 4 })));
+	const result = await runtime.moveSection({ file: "doc.md", source: "Dup", destination: "D", placement: "into" });
+	assert.equal(result.error?.code, "E_AMBIGUOUS_HEADING");
+	assert.match(result.error?.nextAction ?? "", /sourceOccurrence/);
+});
+
+test("unknown/absent role preserves the binary hint (no fabricated target advice)", async () => {
+	// duplicate_heading_match with NO role in context: the adapter must not
+	// fabricate "retry with occurrence" — it preserves the binary's hint.
+	const stdout = envelope("duplicate_heading_match", {}, { total_matches: 2 });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 4 })));
+	const result = await runtime.section({ file: "doc.md", heading: "Dup" });
+	assert.equal(result.error?.code, "E_AMBIGUOUS_HEADING");
+	assert.equal(result.error?.nextAction, "hint for duplicate_heading_match");
+	assert.doesNotMatch(result.error?.nextAction ?? "", /retry with occurrence/i);
+});
+
 test("mutation outcome: pre-start abort is not_started (untouched)", async () => {
 	const controller = new AbortController();
 	controller.abort();
