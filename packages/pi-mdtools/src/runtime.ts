@@ -822,9 +822,10 @@ export class MdtoolsRuntime {
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		// expectEtag passes straight through to the binary's --expect-etag:
-		// a real section-span guard verified in-process by md (atomic with
-		// the splice), replacing the old TS heading-block compare that was
-		// both weaker (heading line only) and racy (separate process).
+		// a section-span content fingerprint rechecked as a same-invocation
+		// drift guard by md (NOT a cross-process compare-and-swap), replacing
+		// the old TS heading-block compare that was weaker (heading line only).
+		// Concurrency across processes is bounded by the per-file mutation queue.
 		const tempDir = await mkdtemp(join(tmpdir(), "pi-mdtools-"));
 		const contentPath = join(tempDir, "section.md");
 		try {

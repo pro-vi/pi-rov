@@ -125,7 +125,7 @@ const ReplaceSectionParams = Type.Object({
 	expectEtag: Type.Optional(
 		Type.String({
 			description:
-				"Optional SECTION etag from md_outline entries (.etag) or md_section (.section.etag) — fingerprints the full section span, heading through body. The md binary verifies it in-process, atomically with the splice, and fails closed if the section changed since the read or if identical duplicate sections make the etag ambiguous.",
+				"Optional SECTION etag from md_outline entries (.etag) or md_section (.section.etag) — a content fingerprint of the full section span, heading through body. The md binary rechecks it as a same-invocation drift guard and fails closed if the section changed since the read, or if identical duplicate sections make the etag ambiguous. It is NOT a cross-process compare-and-swap; Pi serializes same-file mutations.",
 		}),
 	),
 	occurrence: Occurrence,

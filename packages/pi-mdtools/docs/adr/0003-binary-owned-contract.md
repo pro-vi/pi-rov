@@ -1,8 +1,8 @@
 # ADR 0003: The md binary owns the contract; the adapter is a projection
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-07-18)
 - **Date:** 2026-07-17
-- **Deciders:** Provi, Claude build session (representation-integrity audit + external plan review)
+- **Deciders:** Provi, Claude build session (representation-integrity audit + external plan review); amended by the 2026-07-18 closeout (three adversarial review rounds)
 - **Supersedes:** the TS-side implementation strategy of ADR 0002 (the envelope shape and recovery codes it defined stay)
 
 ## Context
@@ -33,6 +33,27 @@ handshakes once per session (`current` requires version AND required
 capabilities), and treats candidates as pure projections of md listings.
 Cross-repo parity tests drive the real binary; a grep-gate test bans
 case-folding from the runtime.
+
+**Closeout amendment (2026-07-18)** — the seam ownership is refined at three
+boundaries the reviews found under-specified:
+
+- **Mutation lifecycle is Pi's, transport authority is the receipt.** Every
+  mutation carries a typed outcome: `completed` only on a validated v1
+  MutationResult receipt, `rejected` on a validated v1 error envelope,
+  `not_started` when proven never spawned, and `indeterminate` for any started
+  call without an authoritative receipt (re-read required). A started
+  nonzero-exit-without-envelope or exit-0-without-a-valid-receipt is
+  indeterminate, never failed-clean.
+- **One observed binary identity.** Classification, execution, recovery
+  enrichment, and status share the resolution whose `md schema` was accepted,
+  pinned by content identity (path + dev/ino/size + nanosecond mtime/ctime)
+  held from before the probe through the pre-spawn checkpoint; recovery never
+  re-resolves. Persistent churn fails closed pre-start.
+- **Ownership-aware atomic cleanup (Rust).** The atomic writer removes a
+  staging temp only when the entry still names the inode it created; a failed
+  exclusive create or a substituted entry is relinquished, never deleted.
+- **Full inventory ≠ prompt-visible subset (bench).** Metadata tooling
+  (`schema`) stays in the classification inventory but is not advertised.
 
 ## Rationale
 
@@ -69,6 +90,18 @@ Negative:
 - Failure-candidate enrichment costs an extra md read on not-found/bad-loc
   paths.
 
+Accepted boundaries (explicit non-goals, not overclaimed):
+
+- Etag guards are **same-invocation drift guards** over a content fingerprint,
+  NOT a cross-process compare-and-swap and NOT a lock. A concurrent external
+  writer between md's read and its atomic rename is out of scope; Pi bounds
+  concurrency with the per-file mutation queue.
+- Observed identity promises **stability at checkpoints**, not exact-inode
+  execution: a swap in the final stat→spawn window remains a documented
+  residual (std has no immutable-handle exec).
+- The atomic writer's check→rename and check→unlink windows remain std-only
+  residuals; the parent directory is not fsynced (old-or-new, never corrupt).
+
 ## Revisit Triggers
 
 - A needed recovery affordance cannot be expressed as a projection of md
@@ -76,11 +109,19 @@ Negative:
 - `mdtools.v2` schema work begins (envelope and capability negotiation must
   be re-designed together).
 - Usage data shows the per-session handshake or enrichment reads are a
-  measurable latency problem in real sessions.
+  measurable latency problem in real sessions (each mutation now also stats the
+  binary once per call for identity — same trigger covers it).
+- Real cross-process or external-writer contention appears: revisit filesystem
+  CAS / cooperative locking and immutable-handle (fd-based) execution, both
+  explicitly deferred out of the 2026-07-18 closeout.
 
 ## References
 
 - Plan: `docs/plans/2026-07-17-001-feat-binary-owned-contract-plan.md`
+- Closeout plan: `docs/plans/2026-07-18-001-fix-binary-contract-closeout-plan.md`
+  (U1 authoritative mutation outcomes, U2 observed executable context, U3
+  ownership-aware atomic cleanup, U4 inventory/prompt-visibility split, U5
+  domain/role-correct remediation, U6 contract wording)
 - mdtools commits: c479494 (envelope), 222ce84 (schema), 092ccdd (etag
   ambiguity + atomic writes), 46be4ec (loc vocabulary)
 - pi-mdtools commits: 1745398 (decoder), 6c75b7e (usage sidecar), 55f35e2

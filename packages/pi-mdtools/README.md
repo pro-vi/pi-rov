@@ -47,7 +47,7 @@ Mutation macros are sequential and use Pi's file mutation queue for the target f
 
 - `md_set_task(file, loc, status, expectEtag?)` — toggle a checkbox by structural loc; `expectEtag` is the task etag from `md_tasks`
 - `md_move_section(file, source, destination, placement)` — relocate a section and auto-relevel by default
-- `md_replace_section(file, heading, content, expectEtag?)` — replace a section; `expectEtag` is the SECTION etag from `md_outline`/`md_section`, verified by the `md` binary in-process, atomically with the splice
+- `md_replace_section(file, heading, content, expectEtag?)` — replace a section; `expectEtag` is the SECTION etag (a content fingerprint) from `md_outline`/`md_section`, rechecked by the `md` binary as a same-invocation drift guard (not a cross-process compare-and-swap — Pi serializes same-file mutations)
 
 Ambiguous heading mutations return `status: "ambiguous"` with `candidates[]` rather than mutating. Stale task locs return `E_BAD_LOC` with current task candidates so the agent can retry with a fresh `loc` from `md_tasks`.
 
@@ -88,16 +88,34 @@ repair command when an upgrade is needed. Resolution order is:
 4. `~/.cargo/bin/md`
 5. `~/.local/bin/md`
 
+Schema classification, execution, recovery, and status all run against **one
+observed binary identity** — the resolution whose `md schema` was accepted,
+pinned by content identity (path + dev/ino/size + nanosecond mtime/ctime) from
+before the probe through the pre-spawn checkpoint. This is *observed stability
+at checkpoints*, not exact-inode execution: a swap in the final stat→spawn
+window is an accepted, documented residual, not a guarantee.
+
+## Mutation outcomes
+
+Every mutation call carries a `mutationOutcome`: `completed` only on a validated
+v1 receipt (status `ok`); `rejected` on a validated v1 error envelope (untouched
+by contract); `not_started` when the mutation is proven never to have spawned
+(pre-spawn abort, unresolved binary — untouched); and `indeterminate` for any
+started call without an authoritative receipt (`E_MD_COMMAND_ABORTED`), where
+the write *may* have committed and a re-read is required before retry.
+
 ## Drift safety
 
-Guards are owned by the `md` binary and verified in-process, atomically with
-the mutation. `md_replace_section` takes a SECTION etag (full section span,
-heading through body) from `md_outline` entries or `md_section`;
-`md_set_task` takes a task etag from `md_tasks`. A stale etag fails closed
-(`E_ETAG_MISMATCH`); identical duplicate targets sharing a fingerprint also
-fail closed (`E_ETAG_AMBIGUOUS`) because a content match cannot prove
-identity. Writes are atomic temp-file-plus-rename: a killed process never
-leaves a truncated document.
+Etag guards are **content fingerprints** rechecked by the `md` binary as a
+**same-invocation drift guard** — not a cross-process compare-and-swap, and not
+a lock: a concurrent external writer between md's read and its atomic rename is
+out of scope (Pi serializes same-file mutations through its file mutation queue).
+`md_replace_section` takes a SECTION etag (full section span, heading through
+body) from `md_outline` entries or `md_section`; `md_set_task` takes a task etag
+from `md_tasks`. A stale etag fails closed (`E_ETAG_MISMATCH`); identical
+duplicate targets sharing a fingerprint also fail closed (`E_ETAG_AMBIGUOUS`)
+because a content match cannot prove identity. Writes are atomic
+temp-file-plus-rename: a killed process never leaves a truncated document.
 
 ## Usage log
 

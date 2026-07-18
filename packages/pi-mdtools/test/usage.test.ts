@@ -195,6 +195,22 @@ test("record appends parseable JSONL to the configured sink", async () => {
 	assert.equal(parsed.schema, USAGE_SCHEMA);
 });
 
+test("contract wording: no atomic/exact-binary overclaim ships in tool-facing surfaces", async () => {
+	// U6 wording sweep: the public claims must match the guarantee. Etag guards
+	// are same-invocation drift checks (not cross-process CAS), and the binary
+	// is executed on an OBSERVED identity (not an exact-inode guarantee).
+	const { readFile } = await import("node:fs/promises");
+	const { fileURLToPath } = await import("node:url");
+	const root = fileURLToPath(new URL("..", import.meta.url));
+	const banned = ["atomically with the splice", "atomic with the splice", "exact binary"];
+	for (const rel of ["index.ts", "src/runtime.ts", "src/prompts.ts", "README.md"]) {
+		const text = await readFile(join(root, rel), "utf8");
+		for (const phrase of banned) {
+			assert.ok(!text.includes(phrase), `${rel} still contains the overclaim "${phrase}"`);
+		}
+	}
+});
+
 test("prompt budget: deduped snippet+guideline cost stays under the cap", () => {
 	// pi dedupes promptGuidelines by exact string across tools, so the real
 	// system-prompt cost is snippets plus UNIQUE guidelines. Budget target:
