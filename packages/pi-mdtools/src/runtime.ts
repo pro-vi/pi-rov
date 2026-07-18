@@ -59,14 +59,14 @@ export const MDTOOLS_SCHEMA_VERSION = "mdtools.v1";
 /// The capability subset the ADAPTER actually depends on for correct behavior
 /// (not the binary's full advertised set). A version match missing any of these
 /// is "legacy" — the adapter would otherwise silently mis-serve a contract it
-/// exposes. Deliberately excluded: `outline_etag` (candidate enrichment
-/// degrades gracefully without it) and `move_section_dual_etag` (the adapter's
+/// exposes. Deliberately excluded: `move_section_dual_etag` (the adapter's
 /// moveSection exposes no source/dest etag params), so a binary lacking only
-/// those is still usable. Each entry has a negative handshake test.
+/// that is still usable. Each entry has a negative handshake test.
 export const REQUIRED_CAPABILITIES = [
 	"error_envelope", // decode the structured error envelope at all
 	"section_etag", // md_replace_section expectEtag guard
 	"task_etag", // md_set_task expectEtag guard
+	"outline_etag", // md_replace_section's prompt promises md_outline as an etag source
 	"occurrence_context", // role/occurrence/candidate projection on ambiguity
 	"etag_ambiguity_fail_closed", // duplicate-etag mutations fail closed, not wrong-target
 	"guarded_flag", // MutationResult.guarded ⇒ guardedResult telemetry
@@ -122,7 +122,7 @@ interface DecodedBinaryError {
 	schemaVersionOk: boolean;
 }
 
-function decodeBinaryErrorEnvelope(stdout: string, exitCode: number | null): DecodedBinaryError | undefined {
+function decodeBinaryErrorEnvelope(stdout: string, exitCode: number | null, expectedFile: string | undefined): DecodedBinaryError | undefined {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(stdout);
@@ -130,6 +130,12 @@ function decodeBinaryErrorEnvelope(stdout: string, exitCode: number | null): Dec
 		return undefined;
 	}
 	if (!isRecord(parsed) || !isRecord(parsed.error)) return undefined;
+	// If the envelope names a top-level file, it must be the file we asked
+	// about. A contradictory file means this is not an authoritative response
+	// for our request — do not trust it as a clean rejection.
+	if (expectedFile !== undefined && typeof parsed.file === "string" && parsed.file !== expectedFile) {
+		return undefined;
+	}
 	const err = parsed.error;
 	const diagnosticCode = stringValue(err.code);
 	const message = stringValue(err.message);
@@ -294,6 +300,17 @@ function resultWithError(options: {
 	nextAction?: string;
 	mutationOutcome?: MutationOutcome;
 }): MdResultEnvelope {
+	// SAFE-RECOVERY invariant: ANY indeterminate outcome must lead with re-read
+	// BEFORE any retry/upgrade — the mutation may have committed before its
+	// response became untrusted, so following upgrade/retry advice blindly could
+	// apply it twice. This central override wins over any per-path nextAction.
+	const indeterminateTail = options.nextAction ?? DEFAULT_NEXT_ACTIONS[options.code];
+	const nextAction =
+		options.mutationOutcome === "indeterminate"
+			? `The mutation may have committed (atomic writes are never partial). Re-read the file with md_outline/md_tasks BEFORE any retry.${
+					indeterminateTail ? ` Only then, if still needed: ${indeterminateTail}` : ""
+				}`
+			: options.nextAction;
 	return {
 		status: options.status,
 		command: options.command,
@@ -304,7 +321,7 @@ function resultWithError(options: {
 			...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
 			...(options.stderr !== undefined ? { stderr: options.stderr } : {}),
 			...(options.hint !== undefined ? { hint: options.hint } : {}),
-			...(options.nextAction !== undefined ? { nextAction: options.nextAction } : {}),
+			...(nextAction !== undefined ? { nextAction } : {}),
 		}),
 		meta: options.meta,
 	};
@@ -642,6 +659,7 @@ const MUTATION_COMMAND_KINDS = new Set([
 	"MoveSection",
 ]);
 const MUTATION_DISPOSITIONS = new Set(["NoChange", "Replaced", "Inserted", "Deleted"]);
+const LINE_ENDING_STYLES = new Set(["Lf", "Crlf", "Mixed"]);
 
 /// The MutationTargetRef discriminant each adapter mutation must carry
 /// (Rust src/model.rs MutationTargetRef). A receipt whose target is not the
@@ -652,26 +670,54 @@ const EXPECTED_TARGET_DISCRIMINANT: Record<string, string> = {
 	ReplaceSection: "Section",
 };
 
+/// What the adapter asked for, so a receipt can be bound to THIS request — not
+/// merely proven to be some valid receipt.
+interface MutationExpectation {
+	command: string;
+	file: string | undefined;
+	/// True iff we passed an etag guard: the receipt's `guarded` must match.
+	guarded: boolean;
+	/// SetTask: the exact loc we targeted (target identity binding).
+	loc?: string;
+}
+
 /// A schema-valid object is NOT automatically a mutation receipt, and a valid
 /// receipt for SOME mutation is not authoritative for THIS one. Validate the
 /// complete required MutationResult wire shape (Rust src/model.rs) — tolerating
-/// additive fields — AND bind it to the request: the command kind and file must
-/// match what we asked for, and the target discriminant must be the one this
-/// command produces. Anything else is indeterminate, never accepted as success.
+/// ADDITIVE fields only — AND bind it to the request: command kind, file, guard
+/// state, the target discriminant, and (where the adapter knows it) the target
+/// identity. Anything else is indeterminate, never accepted as success.
 /// schema_version is already checked upstream.
-function isValidMutationReceipt(data: Record<string, unknown>, expectedCommand: string, expectedFile: string | undefined): boolean {
+function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationExpectation): boolean {
 	if (typeof data.file !== "string" || data.file.length === 0) return false;
-	if (expectedFile !== undefined && data.file !== expectedFile) return false;
-	if (typeof data.command !== "string" || !MUTATION_COMMAND_KINDS.has(data.command)) return false;
-	if (data.command !== expectedCommand) return false;
+	if (expect.file !== undefined && data.file !== expect.file) return false;
+	if (typeof data.command !== "string" || data.command !== expect.command || !MUTATION_COMMAND_KINDS.has(data.command)) return false;
 	if (typeof data.disposition !== "string" || !MUTATION_DISPOSITIONS.has(data.disposition)) return false;
 	if (typeof data.changed !== "boolean") return false;
-	if (typeof data.guarded !== "boolean") return false;
-	if (typeof data.line_endings !== "string" || data.line_endings.length === 0) return false;
+	// Guard state must match what we asked for: a guarded call whose receipt
+	// says guarded:false means the guard silently did not apply.
+	if (typeof data.guarded !== "boolean" || data.guarded !== expect.guarded) return false;
+	if (typeof data.line_endings !== "string" || !LINE_ENDING_STYLES.has(data.line_endings)) return false;
+	// content is a required MutationResult field (string, or null when omitted).
+	if (!("content" in data)) return false;
+	// invariant must carry its full required shape, not just one field.
+	if (
+		!isRecord(data.invariant) ||
+		typeof data.invariant.preserves_non_target_bytes !== "boolean" ||
+		!("target_span_before" in data.invariant) ||
+		!("target_span_after" in data.invariant)
+	) {
+		return false;
+	}
 	if (!isRecord(data.target)) return false;
-	const wantTarget = EXPECTED_TARGET_DISCRIMINANT[expectedCommand];
-	if (wantTarget !== undefined && !isRecord(data.target[wantTarget])) return false;
-	if (!isRecord(data.invariant) || typeof data.invariant.preserves_non_target_bytes !== "boolean") return false;
+	const wantTarget = EXPECTED_TARGET_DISCRIMINANT[expect.command];
+	if (wantTarget !== undefined) {
+		const inner = data.target[wantTarget];
+		// The discriminant's inner object must be present and non-empty.
+		if (!isRecord(inner) || Object.keys(inner).length === 0) return false;
+		// Target IDENTITY binding where the adapter knows it: SetTask's loc.
+		if (expect.loc !== undefined && inner.loc !== expect.loc) return false;
+	}
 	return true;
 }
 
@@ -882,13 +928,19 @@ export class MdtoolsRuntime {
 		// `--` terminates option parsing: a loc (or any future free-form
 		// positional) can never be read as a clap flag.
 		args.push("--", params.loc, file);
-		return await this.runJson("md_set_task", args, file, signal, "SetTask");
+		return await this.runJson("md_set_task", args, file, signal, {
+			command: "SetTask",
+			file,
+			guarded: params.expectEtag !== undefined,
+			loc: params.loc,
+		});
 	}
 
 	async moveSection(params: MoveSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
-		return await this.runJson("md_move_section", args, file, signal, "MoveSection");
+		// moveSection exposes no etag param, so the receipt must be unguarded.
+		return await this.runJson("md_move_section", args, file, signal, { command: "MoveSection", file, guarded: false });
 	}
 
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
@@ -948,7 +1000,11 @@ export class MdtoolsRuntime {
 				});
 			}
 			const realArgs = this.replaceSectionArgs(params, file, contentPath);
-			return await this.runJson("md_replace_section", realArgs, file, signal, "ReplaceSection");
+			return await this.runJson("md_replace_section", realArgs, file, signal, {
+				command: "ReplaceSection",
+				file,
+				guarded: params.expectEtag !== undefined,
+			});
 		} finally {
 			// Cleanup must NEVER throw over the authoritative result (force + swallow).
 			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
@@ -1024,9 +1080,9 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
-		expectedCommand?: string,
+		mutation?: MutationExpectation,
 	): Promise<MdResultEnvelope> {
-		const outcome = await this.runJsonData(command, args, file, signal, expectedCommand);
+		const outcome = await this.runJsonData(command, args, file, signal, mutation);
 		if (!outcome.ok) return outcome.result;
 		return {
 			status: "ok",
@@ -1034,7 +1090,7 @@ export class MdtoolsRuntime {
 			...(file !== undefined ? { file } : {}),
 			// status "ok" for a mutation means a validated v1 receipt was
 			// accepted — the only path that reaches here for mutating calls.
-			...(expectedCommand !== undefined ? { mutationOutcome: "completed" as MutationOutcome } : {}),
+			...(mutation !== undefined ? { mutationOutcome: "completed" as MutationOutcome } : {}),
 			data: outcome.data,
 			meta: commandMeta(command, file, outcome.execution),
 		};
@@ -1045,12 +1101,12 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
-		/// Set for mutation calls to the MutationCommandKind this tool produces
-		/// (e.g. "SetTask"). Presence ⇒ mutating; it also request-binds the
-		/// receipt validator. Undefined ⇒ a query.
-		expectedCommand?: string,
+		/// Set for mutation calls: the request-binding expectation (command
+		/// kind, file, guard state, target identity). Presence ⇒ mutating.
+		/// Undefined ⇒ a query.
+		mutation?: MutationExpectation,
 	): Promise<RunJsonOutcome> {
-		const mutating = expectedCommand !== undefined;
+		const mutating = mutation !== undefined;
 		if (signal?.aborted) {
 			return {
 				ok: false,
@@ -1186,7 +1242,7 @@ export class MdtoolsRuntime {
 		// (right command kind, right file, right target discriminant). Exit 0
 		// with schema-valid-but-not-our-receipt JSON is indeterminate, never
 		// success — the write may have committed while the response was wrong.
-		if (mutating && !isValidMutationReceipt(parsed.data, expectedCommand as string, file)) {
+		if (mutating && !isValidMutationReceipt(parsed.data, mutation as MutationExpectation)) {
 			return {
 				ok: false,
 				result: resultWithError({
@@ -1245,7 +1301,7 @@ export class MdtoolsRuntime {
 			// failed-clean.
 			return legacyFailureResult(command, file, execution, false, mutating ? "indeterminate" : undefined);
 		}
-		const decoded = decodeBinaryErrorEnvelope(execution.stdout, execution.code);
+		const decoded = decodeBinaryErrorEnvelope(execution.stdout, execution.code, file);
 		if (decoded === undefined) {
 			if (signal?.aborted) {
 				// Aborted mid-flight AFTER the process started: same indeterminacy.
@@ -1324,6 +1380,8 @@ export class MdtoolsRuntime {
 			decoded.role !== undefined
 		) {
 			nextAction = `Choose one candidates[].occurrence value and retry with ${occurrenceParamForRole(decoded.role)}.`;
+		} else if (decoded.errorCode === "E_ETAG_AMBIGUOUS" && decoded.role !== undefined) {
+			nextAction = `Identical duplicate targets share this etag; re-query and target one explicitly by ${occurrenceParamForRole(decoded.role)} WITHOUT expectEtag, or edit one duplicate first.`;
 		}
 
 		const result = resultWithError({

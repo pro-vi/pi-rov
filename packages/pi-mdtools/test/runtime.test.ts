@@ -43,6 +43,7 @@ const SCHEMA_OK = JSON.stringify({
 		"error_envelope",
 		"section_etag",
 		"task_etag",
+		"outline_etag",
 		"occurrence_context",
 		"etag_ambiguity_fail_closed",
 		"guarded_flag",
@@ -323,7 +324,12 @@ test("expectEtag: a hyphen-leading value rides as data, never a flag", async () 
 });
 
 test("mutation outcome: a valid v1 receipt is completed", async () => {
-	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt({ command: "SetTask" }))));
+	// receipt loc must match the requested loc (target identity binding)
+	const r = receipt({
+		command: "SetTask",
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, r)));
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
 	assert.equal(result.status, "ok");
 	assert.equal(result.mutationOutcome, "completed");
@@ -400,9 +406,85 @@ test("receipt is request-bound: a receipt for a DIFFERENT file is indeterminate"
 	assert.equal(result.mutationOutcome, "indeterminate");
 });
 
-test("receipt missing a required field (line_endings) is indeterminate", async () => {
-	const noLineEndings = receipt({ line_endings: undefined });
-	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, noLineEndings)));
+test("receipt is request-bound: a receipt for a DIFFERENT loc is indeterminate", async () => {
+	const wrongLoc = receipt({
+		command: "SetTask",
+		target: { TaskItem: { kind: "TaskItem", loc: "9.0", block_index: 9, child_path: [0], span: {} } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrongLoc)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt is request-bound: a guarded call whose receipt says guarded:false is indeterminate", async () => {
+	const unguardedReceipt = receipt({
+		command: "SetTask",
+		guarded: false,
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, unguardedReceipt)));
+	// We asked for a guard (expectEtag); a receipt claiming guarded:false means
+	// the guard silently did not apply — not an authoritative success.
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "abcd" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("error envelope naming a different file is not authoritative", async () => {
+	const stdout = JSON.stringify({
+		schema_version: "mdtools.v1",
+		file: "/work/other.md",
+		error: { code: "etag_mismatch", exit_code: 4, message: "m", hint: "h" },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 4 })));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "aaaa" });
+	assert.equal(result.status, "failed");
+	assert.notEqual(result.mutationOutcome, "rejected");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("indeterminate advice leads with re-read, then upgrade (legacy exit-4 mutation)", async () => {
+	const { runtime } = fakeRuntime((request) =>
+		request.args[0] === "schema"
+			? execution(request, SCHEMA_LEGACY_CAPS)
+			: execution(request, "", { code: 4, stderr: "conflict" }),
+	);
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "aaaa" });
+	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.equal(result.error?.code, "E_MD_VERSION_UNSUPPORTED");
+	const advice = result.error?.nextAction ?? "";
+	assert.match(advice, /re-read/i);
+	// re-read must come BEFORE any upgrade/retry directive
+	assert.ok(advice.toLowerCase().indexOf("re-read") < advice.toLowerCase().indexOf("upgrade"), advice);
+});
+
+test("indeterminate advice leads with re-read (schema-mismatch mutation)", async () => {
+	const v2 = JSON.stringify({ schema_version: "mdtools.v2", file: "/work/doc.md", command: "SetTask" });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, v2)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.match(result.error?.nextAction ?? "", /re-read/i);
+});
+
+test("E_ETAG_AMBIGUOUS occurrence advice is rewritten to the role's Pi parameter (source)", async () => {
+	const stdout = envelope("etag_ambiguous", { exit_code: 4 }, { role: "source", expected_etag: "aaaa", total_matches: 2 });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 4 })));
+	const result = await runtime.moveSection({ file: "doc.md", source: "Dup", destination: "D", placement: "into" });
+	assert.equal(result.error?.code, "E_ETAG_AMBIGUOUS");
+	assert.match(result.error?.nextAction ?? "", /sourceOccurrence/);
+});
+
+test("receipt with an invalid line_endings value is indeterminate", async () => {
+	// Everything else request-bound-correct; ONLY line_endings is out of range,
+	// so this isolates the line_endings check.
+	const badLineEndings = receipt({
+		command: "SetTask",
+		guarded: false,
+		line_endings: "CR", // not one of Lf/Crlf/Mixed
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, badLineEndings)));
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
 	assert.equal(result.status, "failed");
 	assert.equal(result.mutationOutcome, "indeterminate");
