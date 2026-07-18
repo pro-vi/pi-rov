@@ -145,3 +145,22 @@ test("prompt budget: deduped snippet+guideline cost stays under the cap", () => 
 		`prompt surface ~${approxTokens} tokens (${chars} chars) exceeds the 400-token budget; trim snippets/guidelines or consolidate shared bullets`,
 	);
 });
+
+test("fileIdentity: symlink and referent share one identity; missing files fall back", async () => {
+	const { fileIdentity } = await import("../src/usage.js");
+	const { mkdtemp: makeTemp, writeFile: write, symlink } = await import("node:fs/promises");
+	const { tmpdir: osTmp } = await import("node:os");
+	const dir = await makeTemp(join(tmpdir(), "pi-mdtools-ident-"));
+	const real = join(dir, "real.md");
+	const link = join(dir, "link.md");
+	await write(real, "# doc\n", "utf8");
+	await symlink(real, link);
+
+	const viaLink = await fileIdentity(link);
+	const viaReal = await fileIdentity(real);
+	assert.equal(viaLink, viaReal, "symlink and referent are the same document");
+
+	const missing = join(dir, "nope.md");
+	assert.equal(await fileIdentity(missing), missing, "missing files fall back to the lexical path");
+	assert.equal(await fileIdentity(undefined), undefined);
+});
