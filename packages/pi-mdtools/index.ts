@@ -6,7 +6,7 @@ import { formatStatus, helpText, renderMdToolResult } from "./src/content.js";
 import { MD_TOOL_PROMPTS } from "./src/prompts.js";
 import { MdtoolsRuntime, resolveToolPath } from "./src/runtime.js";
 import type { MdResultEnvelope } from "./src/types.js";
-import { UsageTracker } from "./src/usage.js";
+import { UsageTracker, fileIdentity } from "./src/usage.js";
 
 // Session-lived usage instrumentation (consumer-generic schema; see usage.ts).
 const usageTracker = new UsageTracker();
@@ -28,7 +28,7 @@ async function tracked(
 	const start = performance.now();
 	const envelope = await run();
 	const rendered = await renderMdToolResult(envelope);
-	const resolvedPath = params.file !== undefined ? resolveToolPath(cwd, params.file) : undefined;
+	const resolvedPath = await fileIdentity(params.file !== undefined ? resolveToolPath(cwd, params.file) : undefined);
 	const guardedResult = mutationGuardedResult(envelope);
 	usageTracker.record(
 		usageTracker.buildLine({

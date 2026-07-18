@@ -1,4 +1,4 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, realpath } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -59,6 +59,18 @@ export interface UsageLine {
 export function hashFileRef(resolvedPath: string | undefined): string | undefined {
 	if (resolvedPath === undefined) return undefined;
 	return createHash("sha256").update(resolvedPath).digest("hex").slice(0, 8);
+}
+
+/// Canonical file identity for tracking: symlink and referent are the SAME
+/// document (the md binary canonicalizes before mutating), so telemetry must
+/// agree. Falls back to the lexical path when realpath fails (missing file).
+export async function fileIdentity(lexicalPath: string | undefined): Promise<string | undefined> {
+	if (lexicalPath === undefined) return undefined;
+	try {
+		return await realpath(lexicalPath);
+	} catch {
+		return lexicalPath;
+	}
 }
 
 export function usageLogPath(env: NodeJS.ProcessEnv = process.env): string | undefined {

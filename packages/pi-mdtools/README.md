@@ -102,11 +102,14 @@ leaves a truncated document.
 ## Usage log
 
 Each `md_*` call appends one line to
-`~/.local/share/pi-mdtools/usage.jsonl` (`pi-mdtools-usage.v1`): tool, kind,
-outcome, whether an etag guard was attempted, and the re-query signal. No
-document content, headings, or paths are recorded — files appear only as an
-8-char basename hash. Set `PI_MDTOOLS_USAGE_LOG=/path` to redirect or
-`PI_MDTOOLS_USAGE_LOG=""` to disable.
+`~/.local/share/pi-mdtools/usage.jsonl` (`pi-mdtools-usage.v1`): a per-session
+id, tool, kind, outcome, whether an etag guard was attempted (plus
+`guardedResult` cross-checked from the mutation payload on success), and the
+re-query signal. Re-query identity is the file's realpath, so a symlink and
+its referent count as the same document. No content, headings, or paths are
+recorded — files appear only as an 8-char sha256 prefix of the resolved path.
+Set `PI_MDTOOLS_USAGE_LOG=/path` to redirect or `PI_MDTOOLS_USAGE_LOG=""` to
+disable.
 
 ## Demo loop
 
