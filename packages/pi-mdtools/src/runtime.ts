@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
@@ -390,11 +390,14 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 		let stdout = "";
 		let stderr = "";
 		let killed = false;
+		let exited = false;
 		let killReason: "timeout" | "abort" | undefined;
 		let hardKillTimeout: NodeJS.Timeout | undefined;
 
 		const terminate = (reason: "timeout" | "abort") => {
-			if (killed) return;
+			// A process that already exited cannot be "killed": marking it so
+			// would misclassify a completed run as aborted.
+			if (killed || exited) return;
 			killed = true;
 			killReason = reason;
 			child.kill("SIGTERM");
@@ -405,6 +408,12 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 
 		const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		const timeout = setTimeout(() => terminate("timeout"), timeoutMs);
+		// Disarm termination the moment the process exits (stdout may still
+		// be draining until 'close'; only the timers are disarmed here).
+		child.once("exit", () => {
+			exited = true;
+			clearTimeout(timeout);
+		});
 
 		const abort = () => {
 			terminate("abort");
@@ -474,11 +483,12 @@ function legacyFailureResult(
 	execution: MdCommandExecution,
 	legacyBinary: boolean,
 ): MdResultEnvelope {
-	const code: MdErrorCode = execution.killed
-		? "E_MD_COMMAND_ABORTED"
-		: legacyBinary && execution.code === 4
-			? "E_MD_VERSION_UNSUPPORTED"
-			: "E_MD_COMMAND_FAILED";
+	const code: MdErrorCode =
+		execution.killed || execution.code === null
+			? "E_MD_COMMAND_ABORTED"
+			: legacyBinary && execution.code === 4
+				? "E_MD_VERSION_UNSUPPORTED"
+				: "E_MD_COMMAND_FAILED";
 	return resultWithError({
 		status: "failed",
 		command,
@@ -591,10 +601,23 @@ export class MdtoolsRuntime {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	}
 
-	private handshakeCache: { key: string; promise: Promise<MdHandshake> } | undefined;
+	private handshakeCache: { key: string; promise: Promise<{ handshake: MdHandshake; cacheable: boolean }> } | undefined;
 
 	private async resolveBinary(): Promise<MdBinaryResolution> {
 		return await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+	}
+
+	/// Identity is content identity, not a pathname: dev/ino/mtime/size are
+	/// part of the cache key, so replacing the binary IN PLACE invalidates a
+	/// cached verdict just like installing at a new path does.
+	private async binaryIdentityKey(resolution: MdBinaryResolution): Promise<string> {
+		if (!resolution.found || resolution.path === undefined) return "<missing>";
+		try {
+			const s = await stat(resolution.path);
+			return `${resolution.path}:${s.dev}:${s.ino}:${Math.trunc(s.mtimeMs)}:${s.size}`;
+		} catch {
+			return `${resolution.path}:<unstattable>`;
+		}
 	}
 
 	async status(): Promise<MdtoolsStatus> {
@@ -605,31 +628,50 @@ export class MdtoolsRuntime {
 		};
 	}
 
-	/// Probe `md schema --json` once per RESOLVED BINARY IDENTITY. The
-	/// resolution itself is re-checked on every handshake call (cheap fs
-	/// stats), so installing or swapping md mid-session invalidates a cached
-	/// missing/legacy verdict instead of pinning it forever. "current"
-	/// requires the schema version AND the required capability set.
-	async handshake(): Promise<MdHandshake> {
+	/// Probe `md schema --json` once per RESOLVED BINARY IDENTITY
+	/// (path + dev/ino/mtime/size). Re-resolved and re-statted on every call,
+	/// so installing, swapping, or in-place replacing md invalidates a cached
+	/// missing/legacy verdict. Transient probe failures (killed / no exit
+	/// status) are never cached. "current" requires the schema version AND
+	/// the required capability set. Returns the resolution it verified so
+	/// callers execute the exact binary that was handshaken.
+	async handshakeBound(): Promise<{ resolution: MdBinaryResolution; handshake: MdHandshake }> {
 		const resolution = await this.resolveBinary();
-		const key = resolution.found && resolution.path !== undefined ? resolution.path : "<missing>";
+		const key = await this.binaryIdentityKey(resolution);
 		if (this.handshakeCache === undefined || this.handshakeCache.key !== key) {
 			this.handshakeCache = { key, promise: this.probeHandshake(resolution) };
 		}
-		return await this.handshakeCache.promise;
+		const cacheEntry = this.handshakeCache;
+		const probed = await cacheEntry.promise;
+		if (!probed.cacheable && this.handshakeCache === cacheEntry) {
+			this.handshakeCache = undefined;
+		}
+		return { resolution, handshake: probed.handshake };
 	}
 
-	private async probeHandshake(resolution: MdBinaryResolution): Promise<MdHandshake> {
-		if (!resolution.found || resolution.path === undefined) return { verdict: "missing" };
+	async handshake(): Promise<MdHandshake> {
+		return (await this.handshakeBound()).handshake;
+	}
+
+	private async probeHandshake(
+		resolution: MdBinaryResolution,
+	): Promise<{ handshake: MdHandshake; cacheable: boolean }> {
+		if (!resolution.found || resolution.path === undefined) {
+			return { handshake: { verdict: "missing" }, cacheable: true };
+		}
 		const execution = await this.runner({
 			binary: resolution.path,
 			args: ["schema", "--json"],
 			cwd: this.cwd,
 			timeoutMs: this.timeoutMs,
 		});
-		if (execution.code !== 0) return { verdict: "legacy" };
+		if (execution.killed || execution.code === null) {
+			// Transient: the probe never produced an authoritative answer.
+			return { handshake: { verdict: "legacy" }, cacheable: false };
+		}
+		if (execution.code !== 0) return { handshake: { verdict: "legacy" }, cacheable: true };
 		const parsed = parseJsonObject(execution.stdout);
-		if (!parsed.ok) return { verdict: "legacy" };
+		if (!parsed.ok) return { handshake: { verdict: "legacy" }, cacheable: true };
 		const schemaVersion = stringValue(parsed.data.schema_version);
 		const binaryVersion = stringValue(parsed.data.binary_version);
 		const capabilities = Array.isArray(parsed.data.capabilities)
@@ -638,10 +680,13 @@ export class MdtoolsRuntime {
 		const current =
 			schemaVersion === MDTOOLS_SCHEMA_VERSION && REQUIRED_CAPABILITIES.every((cap) => capabilities.includes(cap));
 		return {
-			verdict: current ? "current" : "legacy",
-			...(binaryVersion !== undefined ? { binaryVersion } : {}),
-			...(schemaVersion !== undefined ? { schemaVersion } : {}),
-			capabilities,
+			handshake: {
+				verdict: current ? "current" : "legacy",
+				...(binaryVersion !== undefined ? { binaryVersion } : {}),
+				...(schemaVersion !== undefined ? { schemaVersion } : {}),
+				capabilities,
+			},
+			cacheable: true,
 		};
 	}
 
@@ -668,11 +713,13 @@ export class MdtoolsRuntime {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = ["table", "--json"];
 		if (params.index !== undefined) args.push("--index", String(params.index));
-		if (params.select !== undefined && params.select.trim() !== "") args.push("--select", params.select);
+		// Free-form option VALUES ride as --flag=value so a column named
+		// "--help" or a filter like "--x=y" is data, never an option.
+		if (params.select !== undefined && params.select.trim() !== "") args.push(`--select=${params.select}`);
 		for (const filter of params.where ?? []) {
-			args.push("--where", filter);
+			args.push(`--where=${filter}`);
 		}
-		args.push(file);
+		args.push("--", file);
 		return await this.runJson("md_table", args, file, signal);
 	}
 
@@ -690,14 +737,16 @@ export class MdtoolsRuntime {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = ["set-task", "--json", "--status", params.status, "-i"];
 		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
-		args.push(params.loc, file);
-		return await this.runJson("md_set_task", args, file, signal);
+		// `--` terminates option parsing: a loc (or any future free-form
+		// positional) can never be read as a clap flag.
+		args.push("--", params.loc, file);
+		return await this.runJson("md_set_task", args, file, signal, true);
 	}
 
 	async moveSection(params: MoveSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
-		return await this.runJson("md_move_section", args, file, signal);
+		return await this.runJson("md_move_section", args, file, signal, true);
 	}
 
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
@@ -722,7 +771,7 @@ export class MdtoolsRuntime {
 				});
 			}
 			const realArgs = this.replaceSectionArgs(params, file, contentPath);
-			return await this.runJson("md_replace_section", realArgs, file, signal);
+			return await this.runJson("md_replace_section", realArgs, file, signal, true);
 		} finally {
 			await rm(tempDir, { recursive: true, force: true });
 		}
@@ -785,8 +834,9 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
+		mutating = false,
 	): Promise<MdResultEnvelope> {
-		const outcome = await this.runJsonData(command, args, file, signal);
+		const outcome = await this.runJsonData(command, args, file, signal, mutating);
 		if (!outcome.ok) return outcome.result;
 		return {
 			status: "ok",
@@ -802,6 +852,7 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
+		mutating = false,
 	): Promise<RunJsonOutcome> {
 		if (signal?.aborted) {
 			return {
@@ -819,9 +870,27 @@ export class MdtoolsRuntime {
 			};
 		}
 		// Bind this call to one verified binary identity (cached; re-resolved
-		// so a mid-session install or swap invalidates the verdict).
-		await this.handshake();
-		const resolution = await this.resolveBinary();
+		// and re-statted so a mid-session install/swap/replace invalidates
+		// the verdict) — and execute THAT resolution, not a fresh one.
+		const bound = await this.handshakeBound();
+		const resolution = bound.resolution;
+		// The handshake await is a suspension point: re-check cancellation
+		// before any spawn so pre-start abort still implies untouched.
+		if (signal?.aborted) {
+			return {
+				ok: false,
+				result: unresolvedResultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					args,
+					cwd: this.cwd,
+					code: "E_MD_COMMAND_ABORTED",
+					message: "Aborted before the md command started; the file is untouched.",
+					nextAction: "The call was cancelled before md started; nothing changed. Retry if still wanted.",
+				}),
+			};
+		}
 		if (!resolution.found || resolution.path === undefined) {
 			return {
 				ok: false,
@@ -845,12 +914,15 @@ export class MdtoolsRuntime {
 			timeoutMs: this.timeoutMs,
 			...(signal !== undefined ? { signal } : {}),
 		});
-		if (execution.killed || execution.code !== 0) {
-			return { ok: false, result: await this.failureResult(command, file, execution, signal) };
+		if (execution.killed || execution.code !== 0 || execution.code === null) {
+			return { ok: false, result: await this.failureResult(command, file, execution, signal, mutating) };
 		}
 
 		const parsed = parseJsonObject(execution.stdout);
 		if (!parsed.ok) {
+			// exit 0 means md finished; for a mutation that means the write
+			// almost certainly committed and only the RESPONSE was lost —
+			// indeterminate, never a plain failure.
 			return {
 				ok: false,
 				result: resultWithError({
@@ -859,7 +931,12 @@ export class MdtoolsRuntime {
 					...(file !== undefined ? { file } : {}),
 					meta: commandMeta(command, file, execution),
 					code: "E_MD_JSON_PARSE",
-					message: `Failed to parse md JSON output: ${parsed.message}`,
+					message: mutating
+						? `md exited 0 but its response could not be parsed; the mutation likely committed. ${parsed.message}`
+						: `Failed to parse md JSON output: ${parsed.message}`,
+					...(mutating
+						? { nextAction: "md exited 0, so the mutation almost certainly committed; re-read the file (md_outline/md_tasks) before any retry." }
+						: {}),
 				}),
 			};
 		}
@@ -893,8 +970,16 @@ export class MdtoolsRuntime {
 		file: string | undefined,
 		execution: MdCommandExecution,
 		signal: AbortSignal | undefined,
+		mutating = false,
 	): Promise<MdResultEnvelope> {
-		if (execution.killed) {
+		if (execution.killed || execution.code === null) {
+			// Killed, or the process ended without an authoritative exit
+			// status (spawn/stream error): a started command is
+			// INDETERMINATE — a mutation may have fully committed (atomic
+			// writes are never partial), so the contract is re-read before
+			// retry, never failed-clean. `mutating` is part of the signature
+			// for symmetry with runJsonData; the classification is the same.
+			void mutating;
 			return legacyFailureResult(command, file, execution, false);
 		}
 		const decoded = decodeBinaryErrorEnvelope(execution.stdout);
@@ -958,11 +1043,17 @@ export class MdtoolsRuntime {
 			...(decoded.hint !== undefined ? { hint: decoded.hint } : {}),
 			...(nextAction !== undefined ? { nextAction } : {}),
 		});
-		// Surface the structured etag/loc context instead of discarding it.
+		// Surface the structured context instead of discarding it — the
+		// adapter is a COMPLETE projection of the binary envelope. When the
+		// binary capped matches[], totalMatches tells the caller candidates
+		// are a prefix, not the whole set.
 		if (result.error !== undefined) {
 			if (decoded.expectedEtag !== undefined) result.error.expectedEtag = decoded.expectedEtag;
 			if (decoded.foundEtag !== undefined) result.error.foundEtag = decoded.foundEtag;
 			if (decoded.loc !== undefined) result.error.loc = decoded.loc;
+			if (decoded.role !== undefined) result.error.role = decoded.role;
+			if (decoded.requestedOccurrence !== undefined) result.error.requestedOccurrence = decoded.requestedOccurrence;
+			if (decoded.totalMatches !== undefined) result.error.totalMatches = decoded.totalMatches;
 		}
 		return result;
 	}

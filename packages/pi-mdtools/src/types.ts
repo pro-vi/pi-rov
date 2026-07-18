@@ -68,10 +68,14 @@ export interface MdErrorInfo {
 	exitCode?: number | null;
 	stderr?: string;
 	hint?: string;
-	/// Structured etag/loc context projected from the binary's envelope.
+	/// Structured context projected from the binary's envelope.
 	expectedEtag?: string;
 	foundEtag?: string;
 	loc?: string;
+	role?: "target" | "source" | "destination";
+	requestedOccurrence?: number;
+	/// Full match count from the binary; candidates[] may be a capped prefix.
+	totalMatches?: number;
 }
 
 export interface MdCandidate {

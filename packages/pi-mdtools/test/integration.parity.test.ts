@@ -152,6 +152,31 @@ test("parity: behavioral roundtrips hit the exact adapter codes", { skip: !enabl
 	result = await runtime.section({ file: hyphens, heading: "--help" });
 	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
 
+	// same guarantee for every free-form boundary (round-3 F3): a loc, a
+	// table column, and a filter shaped like flags are data, never options.
+	const flagTasks = join(dir, "flagtasks.md");
+	await writeFile(flagTasks, "- [ ] one\n", "utf8");
+	result = await runtime.setTask({ file: flagTasks, loc: "--help", status: "done" });
+	assert.equal(result.error?.code, "E_BAD_LOC", JSON.stringify(result.error ?? {}));
+
+	const tableDoc = join(dir, "table.md");
+	await writeFile(tableDoc, "| a | b |\n| - | - |\n| 1 | 2 |\n", "utf8");
+	result = await runtime.table({ file: tableDoc, select: "--help" });
+	assert.notEqual(result.error?.code, "E_MD_JSON_PARSE", "select value must never reach clap help");
+	result = await runtime.table({ file: tableDoc, where: ["--help=yes"] });
+	assert.notEqual(result.error?.code, "E_MD_JSON_PARSE", "where value must never reach clap help");
+
+	// above the binary's 20-candidate cap, totalMatches reports the truth (F7)
+	const many = join(dir, "many.md");
+	let body = "# Top\n\n";
+	for (let i = 0; i < 25; i += 1) body += "## Dup\n\nsame\n\n";
+	await writeFile(many, body, "utf8");
+	result = await runtime.section({ file: many, heading: "Dup" });
+	assert.equal(result.status, "ambiguous");
+	assert.equal(result.candidates?.length, 20, "candidates are the capped prefix");
+	assert.equal(result.error?.totalMatches, 25, "totalMatches must expose the full count past the cap");
+	assert.equal(result.error?.role, "target");
+
 	// bad loc -> E_BAD_LOC with current task candidates
 	const tasksDoc = join(dir, "tasks.md");
 	await writeFile(tasksDoc, "- [ ] alpha\n- [x] beta\n", "utf8");
