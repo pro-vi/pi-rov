@@ -56,9 +56,22 @@ type RunJsonOutcome = RunJsonSuccess | RunJsonFailure;
 
 export const MDTOOLS_SCHEMA_VERSION = "mdtools.v1";
 
-/// Capabilities the handshake requires before the binary counts as
-/// "current". A version match without these is "legacy".
-export const REQUIRED_CAPABILITIES = ["error_envelope", "section_etag"] as const;
+/// The capability subset the ADAPTER actually depends on for correct behavior
+/// (not the binary's full advertised set). A version match missing any of these
+/// is "legacy" — the adapter would otherwise silently mis-serve a contract it
+/// exposes. Deliberately excluded: `outline_etag` (candidate enrichment
+/// degrades gracefully without it) and `move_section_dual_etag` (the adapter's
+/// moveSection exposes no source/dest etag params), so a binary lacking only
+/// those is still usable. Each entry has a negative handshake test.
+export const REQUIRED_CAPABILITIES = [
+	"error_envelope", // decode the structured error envelope at all
+	"section_etag", // md_replace_section expectEtag guard
+	"task_etag", // md_set_task expectEtag guard
+	"occurrence_context", // role/occurrence/candidate projection on ambiguity
+	"etag_ambiguity_fail_closed", // duplicate-etag mutations fail closed, not wrong-target
+	"guarded_flag", // MutationResult.guarded ⇒ guardedResult telemetry
+	"atomic_write", // the indeterminate/abort contract relies on never-partial writes
+] as const;
 
 /// Total mapping from the binary's serialized DiagnosticCode to the adapter
 /// error code. Exported so the parity suite can prove totality against
@@ -109,7 +122,7 @@ interface DecodedBinaryError {
 	schemaVersionOk: boolean;
 }
 
-function decodeBinaryErrorEnvelope(stdout: string): DecodedBinaryError | undefined {
+function decodeBinaryErrorEnvelope(stdout: string, exitCode: number | null): DecodedBinaryError | undefined {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(stdout);
@@ -121,6 +134,15 @@ function decodeBinaryErrorEnvelope(stdout: string): DecodedBinaryError | undefin
 	const diagnosticCode = stringValue(err.code);
 	const message = stringValue(err.message);
 	if (diagnosticCode === undefined || message === undefined) return undefined;
+	// An authoritative v1 error envelope carries exit_code, and it must AGREE
+	// with the child's actual exit. A missing or contradictory exit_code means
+	// the envelope is not authoritative (crafted, truncated, or a wrong-binary
+	// response) — return undefined so the caller falls through to the
+	// indeterminate/legacy path rather than trusting it as a clean rejection.
+	const envelopeExit = integerValue(err.exit_code);
+	if (envelopeExit === undefined || (exitCode !== null && envelopeExit !== exitCode)) {
+		return undefined;
+	}
 
 	const errorCode = DIAGNOSTIC_TO_ERROR_CODE[diagnosticCode] ?? "E_MD_COMMAND_FAILED";
 	const status: "ambiguous" | "failed" =
@@ -388,17 +410,43 @@ export async function resolveMdBinary(options: {
 
 export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
 	return await new Promise<MdCommandExecution>((resolveExecution) => {
-		const child = spawn(request.binary, request.args, {
-			cwd: request.cwd,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-
 		let stdout = "";
 		let stderr = "";
 		let killed = false;
 		let exited = false;
+		let started = false;
 		let killReason: "timeout" | "abort" | undefined;
 		let hardKillTimeout: NodeJS.Timeout | undefined;
+
+		// spawn() can throw SYNCHRONOUSLY (bad args, some path errors). Catch it
+		// and RESOLVE (never reject) so a mutation call can classify it as a
+		// clean pre-start failure — a raw promise rejection would escape the
+		// lifecycle classifier entirely.
+		let child;
+		try {
+			child = spawn(request.binary, request.args, {
+				cwd: request.cwd,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+		} catch (error) {
+			resolveExecution({
+				binary: request.binary,
+				args: request.args,
+				cwd: request.cwd,
+				code: null,
+				stdout: "",
+				stderr: error instanceof Error ? error.message : String(error),
+				killed: false,
+				started: false,
+			});
+			return;
+		}
+
+		// The child spawned: from here a lost result is INDETERMINATE, not
+		// "never started".
+		child.once("spawn", () => {
+			started = true;
+		});
 
 		const terminate = (reason: "timeout" | "abort") => {
 			// A process that already exited cannot be "killed": marking it so
@@ -451,6 +499,7 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 				stdout,
 				stderr: stderr.length > 0 ? stderr : error.message,
 				killed,
+				started,
 			});
 		});
 
@@ -467,6 +516,7 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 				stdout,
 				stderr: stderrText,
 				killed,
+				started,
 			});
 		});
 	});
@@ -593,18 +643,34 @@ const MUTATION_COMMAND_KINDS = new Set([
 ]);
 const MUTATION_DISPOSITIONS = new Set(["NoChange", "Replaced", "Inserted", "Deleted"]);
 
-/// A schema-valid object is NOT automatically a mutation receipt. Validate the
-/// required MutationResult fields (Rust src/model.rs) while tolerating additive
-/// fields, so an exit-0 response that is JSON-but-not-a-receipt is classified
-/// indeterminate, never accepted as success. schema_version is already checked
-/// upstream before this runs.
-function isValidMutationReceipt(data: Record<string, unknown>): boolean {
+/// The MutationTargetRef discriminant each adapter mutation must carry
+/// (Rust src/model.rs MutationTargetRef). A receipt whose target is not the
+/// discriminant this command produces is not our receipt.
+const EXPECTED_TARGET_DISCRIMINANT: Record<string, string> = {
+	SetTask: "TaskItem",
+	MoveSection: "SectionMove",
+	ReplaceSection: "Section",
+};
+
+/// A schema-valid object is NOT automatically a mutation receipt, and a valid
+/// receipt for SOME mutation is not authoritative for THIS one. Validate the
+/// complete required MutationResult wire shape (Rust src/model.rs) — tolerating
+/// additive fields — AND bind it to the request: the command kind and file must
+/// match what we asked for, and the target discriminant must be the one this
+/// command produces. Anything else is indeterminate, never accepted as success.
+/// schema_version is already checked upstream.
+function isValidMutationReceipt(data: Record<string, unknown>, expectedCommand: string, expectedFile: string | undefined): boolean {
 	if (typeof data.file !== "string" || data.file.length === 0) return false;
+	if (expectedFile !== undefined && data.file !== expectedFile) return false;
 	if (typeof data.command !== "string" || !MUTATION_COMMAND_KINDS.has(data.command)) return false;
+	if (data.command !== expectedCommand) return false;
 	if (typeof data.disposition !== "string" || !MUTATION_DISPOSITIONS.has(data.disposition)) return false;
 	if (typeof data.changed !== "boolean") return false;
 	if (typeof data.guarded !== "boolean") return false;
+	if (typeof data.line_endings !== "string" || data.line_endings.length === 0) return false;
 	if (!isRecord(data.target)) return false;
+	const wantTarget = EXPECTED_TARGET_DISCRIMINANT[expectedCommand];
+	if (wantTarget !== undefined && !isRecord(data.target[wantTarget])) return false;
 	if (!isRecord(data.invariant) || typeof data.invariant.preserves_non_target_bytes !== "boolean") return false;
 	return true;
 }
@@ -671,7 +737,9 @@ export class MdtoolsRuntime {
 		// separate resolve + separate handshake that could disagree.
 		const observed = await this.acquireStableContext();
 		if (observed === undefined) {
-			return { binary: await this.resolveBinary(), cwd: this.cwd, handshake: { verdict: "legacy" } };
+			// Could not observe a stable identity: report the resolution WITHOUT
+			// inventing a verdict for a binary we never successfully probed.
+			return { binary: await this.resolveBinary(), cwd: this.cwd };
 		}
 		return { binary: observed.resolution, cwd: this.cwd, handshake: observed.handshake };
 	}
@@ -688,6 +756,10 @@ export class MdtoolsRuntime {
 		for (let attempt = 0; attempt < this.maxIdentityAttempts; attempt += 1) {
 			const resolution = await this.resolveBinary();
 			const keyBefore = await this.binaryIdentityKey(resolution);
+			// A binary that resolves but cannot be statted has NO provable
+			// identity — never treat the "<unstattable>" sentinel as stable
+			// (two failed stats must not compare equal into a false verdict).
+			if (keyBefore.endsWith("<unstattable>")) continue;
 			const handshake = await this.probeFor(resolution, keyBefore);
 			// Re-stat the SAME resolved path: unchanged from before the probe
 			// through here means the verdict describes the binary we will run.
@@ -810,13 +882,13 @@ export class MdtoolsRuntime {
 		// `--` terminates option parsing: a loc (or any future free-form
 		// positional) can never be read as a clap flag.
 		args.push("--", params.loc, file);
-		return await this.runJson("md_set_task", args, file, signal, true);
+		return await this.runJson("md_set_task", args, file, signal, "SetTask");
 	}
 
 	async moveSection(params: MoveSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
-		return await this.runJson("md_move_section", args, file, signal, true);
+		return await this.runJson("md_move_section", args, file, signal, "MoveSection");
 	}
 
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
@@ -825,11 +897,43 @@ export class MdtoolsRuntime {
 		// a section-span content fingerprint rechecked as a same-invocation
 		// drift guard by md (NOT a cross-process compare-and-swap), replacing
 		// the old TS heading-block compare that was weaker (heading line only).
-		// Concurrency across processes is bounded by the per-file mutation queue.
-		const tempDir = await mkdtemp(join(tmpdir(), "pi-mdtools-"));
+		// Concurrency is bounded by Pi's per-file mutation queue WITHIN this
+		// process; it does not serialize other processes.
+		let tempDir: string;
+		try {
+			tempDir = await mkdtemp(join(tmpdir(), "pi-mdtools-"));
+		} catch (error) {
+			// Staging never created ⇒ the mutation never started ⇒ untouched.
+			return unresolvedResultWithError({
+				status: "failed",
+				command: "md_replace_section",
+				file,
+				args: [],
+				cwd: this.cwd,
+				code: "E_MD_COMMAND_ABORTED",
+				message: `could not stage replacement content: ${error instanceof Error ? error.message : String(error)}`,
+				nextAction: "md never started (staging failed); the file is untouched. Retry if still wanted.",
+				mutationOutcome: "not_started",
+			});
+		}
 		const contentPath = join(tempDir, "section.md");
 		try {
-			await writeFile(contentPath, params.content, "utf8");
+			try {
+				await writeFile(contentPath, params.content, "utf8");
+			} catch (error) {
+				// Staging write failed before md ran ⇒ untouched.
+				return unresolvedResultWithError({
+					status: "failed",
+					command: "md_replace_section",
+					file,
+					args: [],
+					cwd: this.cwd,
+					code: "E_MD_COMMAND_ABORTED",
+					message: `could not stage replacement content: ${error instanceof Error ? error.message : String(error)}`,
+					nextAction: "md never started (staging failed); the file is untouched. Retry if still wanted.",
+					mutationOutcome: "not_started",
+				});
+			}
 			if (signal?.aborted) {
 				return unresolvedResultWithError({
 					status: "failed",
@@ -839,12 +943,15 @@ export class MdtoolsRuntime {
 					cwd: this.cwd,
 					code: "E_MD_COMMAND_ABORTED",
 					message: "Aborted before the md command started; the file is untouched.",
+					nextAction: "The call was cancelled before md started; nothing changed. Retry if still wanted.",
+					mutationOutcome: "not_started",
 				});
 			}
 			const realArgs = this.replaceSectionArgs(params, file, contentPath);
-			return await this.runJson("md_replace_section", realArgs, file, signal, true);
+			return await this.runJson("md_replace_section", realArgs, file, signal, "ReplaceSection");
 		} finally {
-			await rm(tempDir, { recursive: true, force: true });
+			// Cleanup must NEVER throw over the authoritative result (force + swallow).
+			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		}
 	}
 
@@ -894,6 +1001,12 @@ export class MdtoolsRuntime {
 		if (signal?.aborted) return undefined;
 		const resolution = observed.resolution;
 		if (!resolution.found || resolution.path === undefined) return undefined;
+		// Re-stat immediately before recovery execution: if the binary at this
+		// path is no longer the one whose failure we are enriching (in-place
+		// replacement) — or identity can no longer be proven — skip enrichment
+		// rather than run a DIFFERENT binary and inject its candidates.
+		const identityNow = await this.binaryIdentityKey(resolution);
+		if (identityNow !== observed.identityKey || identityNow.endsWith("<unstattable>")) return undefined;
 		const execution = await this.runner({
 			binary: resolution.path,
 			args,
@@ -911,9 +1024,9 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
-		mutating = false,
+		expectedCommand?: string,
 	): Promise<MdResultEnvelope> {
-		const outcome = await this.runJsonData(command, args, file, signal, mutating);
+		const outcome = await this.runJsonData(command, args, file, signal, expectedCommand);
 		if (!outcome.ok) return outcome.result;
 		return {
 			status: "ok",
@@ -921,7 +1034,7 @@ export class MdtoolsRuntime {
 			...(file !== undefined ? { file } : {}),
 			// status "ok" for a mutation means a validated v1 receipt was
 			// accepted — the only path that reaches here for mutating calls.
-			...(mutating ? { mutationOutcome: "completed" as MutationOutcome } : {}),
+			...(expectedCommand !== undefined ? { mutationOutcome: "completed" as MutationOutcome } : {}),
 			data: outcome.data,
 			meta: commandMeta(command, file, outcome.execution),
 		};
@@ -932,8 +1045,12 @@ export class MdtoolsRuntime {
 		args: string[],
 		file: string | undefined,
 		signal: AbortSignal | undefined,
-		mutating = false,
+		/// Set for mutation calls to the MutationCommandKind this tool produces
+		/// (e.g. "SetTask"). Presence ⇒ mutating; it also request-binds the
+		/// receipt validator. Undefined ⇒ a query.
+		expectedCommand?: string,
 	): Promise<RunJsonOutcome> {
+		const mutating = expectedCommand !== undefined;
 		if (signal?.aborted) {
 			return {
 				ok: false,
@@ -1065,10 +1182,11 @@ export class MdtoolsRuntime {
 			};
 		}
 
-		// A mutation is "completed" ONLY on a validated v1 receipt. Exit 0 with
-		// schema-valid-but-not-a-receipt JSON is indeterminate, never success —
-		// the write may have committed while the response was junk.
-		if (mutating && !isValidMutationReceipt(parsed.data)) {
+		// A mutation is "completed" ONLY on a validated, REQUEST-BOUND v1 receipt
+		// (right command kind, right file, right target discriminant). Exit 0
+		// with schema-valid-but-not-our-receipt JSON is indeterminate, never
+		// success — the write may have committed while the response was wrong.
+		if (mutating && !isValidMutationReceipt(parsed.data, expectedCommand as string, file)) {
 			return {
 				ok: false,
 				result: resultWithError({
@@ -1099,15 +1217,35 @@ export class MdtoolsRuntime {
 		mutating: boolean,
 		observed: ObservedContext,
 	): Promise<MdResultEnvelope> {
+		if (!execution.started) {
+			// The child never spawned (synchronous spawn throw, or an
+			// ENOENT-class error before the spawn event): PROVEN untouched.
+			return resultWithError({
+				status: "failed",
+				command,
+				...(file !== undefined ? { file } : {}),
+				meta: commandMeta(command, file, execution),
+				code: "E_MD_COMMAND_ABORTED",
+				message: `md never started: ${errorMessage(execution)}`,
+				exitCode: execution.code,
+				...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
+				...(mutating
+					? {
+							mutationOutcome: "not_started" as MutationOutcome,
+							nextAction: "md never started; the file is untouched. Retry if still wanted.",
+						}
+					: {}),
+			});
+		}
 		if (execution.killed || execution.code === null) {
-			// Killed, or the process ended without an authoritative exit
-			// status (spawn/stream error): a started command is
-			// INDETERMINATE — a mutation may have fully committed (atomic
-			// writes are never partial), so the contract is re-read before
-			// retry, never failed-clean.
+			// Started, then killed or ended without an authoritative exit status
+			// (timeout/abort, or stream error after spawn): a started command is
+			// INDETERMINATE — a mutation may have fully committed (atomic writes
+			// are never partial), so the contract is re-read before retry, never
+			// failed-clean.
 			return legacyFailureResult(command, file, execution, false, mutating ? "indeterminate" : undefined);
 		}
-		const decoded = decodeBinaryErrorEnvelope(execution.stdout);
+		const decoded = decodeBinaryErrorEnvelope(execution.stdout, execution.code);
 		if (decoded === undefined) {
 			if (signal?.aborted) {
 				// Aborted mid-flight AFTER the process started: same indeterminacy.
@@ -1116,10 +1254,12 @@ export class MdtoolsRuntime {
 			// Reuse the SAME observed context — never re-resolve or re-handshake
 			// a possibly-different binary inside failure classification.
 			const legacyBinary = observed.handshake.verdict !== "current";
-			// A legacy binary's bare conflict exit (4) is a pre-write guard
-			// rejection on an old binary — untouched, not indeterminate.
+			// A legacy binary's bare conflict exit (4) most likely means a
+			// pre-write guard rejection on an old binary, but without a v1
+			// envelope we cannot PROVE it committed nothing: surface the
+			// upgrade-required code AND mark a started mutation indeterminate.
 			if (legacyBinary && execution.code === 4) {
-				return legacyFailureResult(command, file, execution, true);
+				return legacyFailureResult(command, file, execution, true, mutating ? "indeterminate" : undefined);
 			}
 			// A started MUTATION that exited nonzero without an authoritative
 			// v1 envelope is indeterminate, never failed-clean: the write may

@@ -15,6 +15,7 @@ function execution(request: MdCommandRequest, stdout: string, overrides: Partial
 		stdout,
 		stderr: "",
 		killed: false,
+		started: true,
 		...overrides,
 	};
 }
@@ -38,7 +39,15 @@ function fakeRuntime(handler: (request: MdCommandRequest) => MdCommandExecution 
 const SCHEMA_OK = JSON.stringify({
 	schema_version: "mdtools.v1",
 	binary_version: "0.1.0",
-	capabilities: ["error_envelope", "section_etag", "task_etag"],
+	capabilities: [
+		"error_envelope",
+		"section_etag",
+		"task_etag",
+		"occurrence_context",
+		"etag_ambiguity_fail_closed",
+		"guarded_flag",
+		"atomic_write",
+	],
 	commands: [],
 	diagnostic_codes: [],
 });
@@ -157,7 +166,7 @@ test("role source in the envelope steers advice to sourceOccurrence", async () =
 });
 
 test("occurrence_out_of_range maps to its own code with requested/total context", async () => {
-	const stdout = envelope("occurrence_out_of_range", {}, {
+	const stdout = envelope("occurrence_out_of_range", { exit_code: 1 }, {
 		role: "destination",
 		requested_occurrence: 9,
 		total_matches: 2,
@@ -194,7 +203,7 @@ test("etag_mismatch and etag_ambiguous map distinctly", async () => {
 });
 
 test("heading_not_found enriches candidates from a follow-up outline listing", async () => {
-	const notFound = envelope("heading_not_found", {}, { role: "target", total_matches: 0 });
+	const notFound = envelope("heading_not_found", { exit_code: 1 }, { role: "target", total_matches: 0 });
 	const outline = JSON.stringify({
 		schema_version: "mdtools.v1",
 		file: "/work/doc.md",
@@ -219,7 +228,7 @@ test("heading_not_found enriches candidates from a follow-up outline listing", a
 });
 
 test("bad loc enriches candidates from a follow-up tasks listing", async () => {
-	const badLoc = envelope("invalid_task_loc", {}, { loc: "bogus" });
+	const badLoc = envelope("invalid_task_loc", { exit_code: 3 }, { loc: "bogus" });
 	const tasks = JSON.stringify({
 		schema_version: "mdtools.v1",
 		results: [
@@ -246,7 +255,7 @@ test("bad loc enriches candidates from a follow-up tasks listing", async () => {
 });
 
 test("unmapped diagnostic codes stay visible, never silent", async () => {
-	const stdout = envelope("space_weather", {});
+	const stdout = envelope("space_weather", { exit_code: 1 });
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 1 })));
 	const result = await runtime.outline({ file: "doc.md" });
 	assert.equal(result.error?.code, "E_MD_COMMAND_FAILED");
@@ -373,6 +382,116 @@ test("unknown/absent role preserves the binary hint (no fabricated target advice
 	assert.equal(result.error?.code, "E_AMBIGUOUS_HEADING");
 	assert.equal(result.error?.nextAction, "hint for duplicate_heading_match");
 	assert.doesNotMatch(result.error?.nextAction ?? "", /retry with occurrence/i);
+});
+
+test("receipt is request-bound: a receipt for a DIFFERENT command is indeterminate", async () => {
+	const wrong = receipt({ command: "ReplaceSection", target: { Section: {} } });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt is request-bound: a receipt for a DIFFERENT file is indeterminate", async () => {
+	const wrong = receipt({ file: "/work/other.md" });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt missing a required field (line_endings) is indeterminate", async () => {
+	const noLineEndings = receipt({ line_endings: undefined });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, noLineEndings)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("error envelope whose exit_code contradicts the child exit is not authoritative", async () => {
+	// envelope claims exit 4 but the child exited 1: a crafted/wrong-binary
+	// response must NOT be trusted as a clean rejection.
+	const stdout = envelope("etag_mismatch", { exit_code: 4 }, { expected_etag: "aaaa", found_etag: "bbbb" });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 1 })));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "aaaa" });
+	assert.equal(result.status, "failed");
+	assert.notEqual(result.mutationOutcome, "rejected");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("lifecycle: a child that never spawns is not_started (untouched)", async () => {
+	const { runtime } = fakeRuntime(
+		withSchema(SCHEMA_OK, (request) => execution(request, "", { code: null, started: false, stderr: "spawn ENOENT" })),
+	);
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
+	assert.match(result.error?.nextAction ?? "", /untouched/i);
+});
+
+test("lifecycle: replaceSection pre-abort is not_started", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt({ command: "ReplaceSection", target: { Section: {} } }))));
+	const result = await runtime.replaceSection({ file: "doc.md", heading: "H", content: "x" }, controller.signal);
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
+});
+
+test("recovery skips enrichment when the binary identity changed after the failure", async () => {
+	const { mkdtemp: makeTemp, writeFile: write, chmod } = await import("node:fs/promises");
+	const dir = await makeTemp(join(import.meta.dirname, "../node_modules/.tmp-rec-"));
+	const binPath = join(dir, "md");
+	await write(binPath, "#!/bin/sh\nexit 0\n", "utf8");
+	await chmod(binPath, 0o755);
+
+	const notFound = envelope("heading_not_found", { exit_code: 1 }, { role: "target", total_matches: 0 });
+	const outline = JSON.stringify({ schema_version: "mdtools.v1", entries: [{ heading: { text: "Real", block_index: 0, level: 1 }, etag: "e" }] });
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") return execution(request, SCHEMA_OK);
+		if (request.args[0] === "section") {
+			// Replace the binary IN PLACE before enrichment can run.
+			await write(binPath, "#!/bin/sh\n# replaced\nexit 0\n", "utf8");
+			return execution(request, notFound, { code: 1 });
+		}
+		return execution(request, outline); // enrichment outline (must NOT run)
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: binPath, runner });
+	const result = await runtime.section({ file: "doc.md", heading: "Nope" });
+	assert.equal(result.error?.code, "E_HEADING_NOT_FOUND");
+	assert.equal(result.candidates, undefined, "enrichment must be skipped when identity changed under us");
+});
+
+test("each adapter-required capability is enforced: missing any one ⇒ legacy", async () => {
+	const { REQUIRED_CAPABILITIES } = await import("../src/runtime.js");
+	for (const missing of REQUIRED_CAPABILITIES) {
+		const caps = REQUIRED_CAPABILITIES.filter((c) => c !== missing);
+		const schema = JSON.stringify({ schema_version: "mdtools.v1", binary_version: "0.1.0", capabilities: caps, commands: [], diagnostic_codes: [] });
+		const { runtime } = fakeRuntime(withSchema(schema, (request) => execution(request, "{}")));
+		const handshake = await runtime.handshake();
+		assert.equal(handshake.verdict, "legacy", `a binary missing ${missing} must be legacy, not current`);
+	}
+});
+
+test("status does not invent a verdict when identity cannot be observed", async () => {
+	const { mkdtemp: makeTemp, writeFile: write, chmod } = await import("node:fs/promises");
+	const dir = await makeTemp(join(import.meta.dirname, "../node_modules/.tmp-st-"));
+	const binPath = join(dir, "md");
+	await write(binPath, "#!/bin/sh\nexit 0\n", "utf8");
+	await chmod(binPath, 0o755);
+	let counter = 0;
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") {
+			counter += 1;
+			await write(binPath, `#!/bin/sh\n# rev ${counter}\nexit 0\n`, "utf8"); // churn every probe
+			return execution(request, SCHEMA_OK);
+		}
+		return execution(request, "{}");
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: binPath, runner });
+	const status = await runtime.status();
+	assert.equal(status.binary.found, true);
+	assert.equal(status.handshake, undefined, "an unobservable binary must not be labeled with an invented verdict");
 });
 
 test("mutation outcome: pre-start abort is not_started (untouched)", async () => {

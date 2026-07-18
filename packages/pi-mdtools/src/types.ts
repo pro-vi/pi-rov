@@ -54,6 +54,11 @@ export interface MdCommandExecution {
 	stdout: string;
 	stderr: string;
 	killed: boolean;
+	/// True once the child process actually spawned (the `spawn` event fired).
+	/// Distinguishes a pre-spawn failure (never started ⇒ untouched) from a
+	/// post-start result loss (started ⇒ indeterminate). A synchronous spawn
+	/// throw or an ENOENT-class error before spawn leaves this false.
+	started: boolean;
 }
 
 export type MdCommandRunner = (request: MdCommandRequest) => Promise<MdCommandExecution>;

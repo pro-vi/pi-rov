@@ -41,6 +41,7 @@ test("parity: every subcommand and flag the adapter emits exists in md schema", 
 			stdout: JSON.stringify({ schema_version: "mdtools.v1", entries: [], results: [], blocks: [] }),
 			stderr: "",
 			killed: false,
+			started: true,
 		};
 	};
 	const rt = new MdtoolsRuntime({ cwd: "/work", binary: process.execPath, runner: recorder });
