@@ -58,6 +58,73 @@ test("requeried fires only for the SAME resolved file, not same basenames", () =
 	assert.equal(otherFile.requeried, false);
 });
 
+test("indeterminate mutations mark the file re-query-relevant (may have committed)", () => {
+	const tracker = new UsageTracker();
+	tracker.buildLine({
+		tool: "md_set_task",
+		resolvedPath: "/work/doc.md",
+		guarded: false,
+		ok: false,
+		mutationOutcome: "indeterminate",
+		durationMs: 5,
+		outputBytes: 80,
+	});
+	const query = tracker.buildLine({
+		tool: "md_tasks",
+		resolvedPath: "/work/doc.md",
+		guarded: false,
+		ok: true,
+		durationMs: 2,
+		outputBytes: 40,
+	});
+	assert.equal(query.requeried, true);
+});
+
+test("not_started mutations leave the file untouched (no re-query trigger)", () => {
+	const tracker = new UsageTracker();
+	tracker.buildLine({
+		tool: "md_set_task",
+		resolvedPath: "/work/doc.md",
+		guarded: false,
+		ok: false,
+		mutationOutcome: "not_started",
+		durationMs: 5,
+		outputBytes: 80,
+	});
+	const query = tracker.buildLine({
+		tool: "md_tasks",
+		resolvedPath: "/work/doc.md",
+		guarded: false,
+		ok: true,
+		durationMs: 2,
+		outputBytes: 40,
+	});
+	assert.equal(query.requeried, false);
+});
+
+test("rejected mutations leave the file untouched (no re-query trigger)", () => {
+	const tracker = new UsageTracker();
+	tracker.buildLine({
+		tool: "md_replace_section",
+		resolvedPath: "/work/doc.md",
+		guarded: true,
+		ok: false,
+		mutationOutcome: "rejected",
+		errorCode: "E_ETAG_MISMATCH",
+		durationMs: 5,
+		outputBytes: 80,
+	});
+	const query = tracker.buildLine({
+		tool: "md_outline",
+		resolvedPath: "/work/doc.md",
+		guarded: false,
+		ok: true,
+		durationMs: 2,
+		outputBytes: 40,
+	});
+	assert.equal(query.requeried, false);
+});
+
 test("failed mutations do not mark the file as mutated", () => {
 	const tracker = new UsageTracker();
 	tracker.buildLine({

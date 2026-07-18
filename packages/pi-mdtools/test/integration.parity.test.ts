@@ -222,6 +222,32 @@ test("parity: behavioral roundtrips hit the exact adapter codes", { skip: !enabl
 	assert.equal((result.data as { changed?: boolean })?.changed, true);
 });
 
+test("parity: a real mutation returns a validated receipt as completed", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "tasks.md");
+	await writeFile(doc, "- [ ] alpha\n- [ ] beta\n", "utf8");
+	const result = await runtime.setTask({ file: doc, loc: "0.0", status: "done" });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+	assert.equal(result.mutationOutcome, "completed");
+	assert.equal((result.data as { changed?: boolean })?.changed, true);
+});
+
+test("parity: expectEtag with a hyphen-leading value reaches md as data, never clap", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "tasks.md");
+	await writeFile(doc, "- [ ] alpha\n", "utf8");
+	// "--help" as an etag value must be treated as an (ambiguity/mismatch)
+	// etag diagnostic, never a clap parse error and never md's help text.
+	const result = await runtime.setTask({ file: doc, loc: "0.0", status: "done", expectEtag: "--help" });
+	assert.equal(result.status, "failed");
+	assert.notEqual(result.error?.code, "E_MD_JSON_PARSE");
+	assert.notEqual(result.mutationOutcome, "completed");
+	assert.ok(
+		result.error?.code === "E_ETAG_MISMATCH" || result.error?.code === "E_ETAG_AMBIGUOUS",
+		`expected an etag diagnostic, got ${result.error?.code}`,
+	);
+});
+
 test("parity: TOOL_KIND matches md schema's per-command kind", { skip: !enabled }, async () => {
 	const { TOOL_KIND } = await import("../src/usage.js");
 	const schema = realSchema();

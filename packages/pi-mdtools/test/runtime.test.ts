@@ -65,6 +65,25 @@ function envelope(code: string, extra: Record<string, unknown> = {}, context: Re
 	});
 }
 
+/// A well-formed MutationResult receipt (mirrors Rust src/model.rs: PascalCase
+/// command/disposition, required target + invariant). The runtime accepts a
+/// mutation as "completed" only against a shape like this.
+function receipt(overrides: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		schema_version: "mdtools.v1",
+		file: "/work/doc.md",
+		command: "SetTask",
+		target: { TaskItem: { kind: "TaskItem", loc: "0.0", block_index: 1, child_path: [0], span: {} } },
+		disposition: "Replaced",
+		changed: true,
+		guarded: false,
+		line_endings: "Lf",
+		invariant: { preserves_non_target_bytes: true, target_span_before: null, target_span_after: null },
+		content: null,
+		...overrides,
+	});
+}
+
 /// Route a request: `md schema` gets the handshake payload; everything else
 /// goes to the per-test handler.
 function withSchema(schemaStdout: string, handler: (request: MdCommandRequest) => MdCommandExecution) {
@@ -272,18 +291,79 @@ test("handshake: missing required capability is legacy even on a version match",
 	assert.equal(handshake.binaryVersion, "0.1.0");
 });
 
-test("expectEtag wires through to --expect-etag for set-task and replace-section", async () => {
-	const ok = JSON.stringify({ schema_version: "mdtools.v1", changed: true });
-	const { runtime, calls } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, ok)));
+test("expectEtag wires through as --expect-etag=<value> (no re-entry into option parsing)", async () => {
+	const { runtime, calls } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt())));
 	await runtime.setTask({ file: "doc.md", loc: "0.0", status: "done", expectEtag: "abcd" });
 	const setTaskCall = calls.find((c) => c.args[0] === "set-task");
-	assert.ok(setTaskCall?.args.includes("--expect-etag"));
-	assert.ok(setTaskCall?.args.includes("abcd"));
+	assert.ok(setTaskCall?.args.includes("--expect-etag=abcd"));
+	// never the two-token form that a hyphen-leading value could hijack
+	assert.ok(!setTaskCall?.args.includes("--expect-etag"));
 
 	await runtime.replaceSection({ file: "doc.md", heading: "Alpha", content: "x", expectEtag: "efef" });
 	const replaceCall = calls.find((c) => c.args[0] === "replace-section");
-	assert.ok(replaceCall?.args.includes("--expect-etag"));
-	assert.ok(replaceCall?.args.includes("efef"));
+	assert.ok(replaceCall?.args.includes("--expect-etag=efef"));
+	assert.ok(!replaceCall?.args.includes("--expect-etag"));
+});
+
+test("expectEtag: a hyphen-leading value rides as data, never a flag", async () => {
+	const { runtime, calls } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt())));
+	await runtime.setTask({ file: "doc.md", loc: "0.0", status: "done", expectEtag: "--help" });
+	const setTaskCall = calls.find((c) => c.args[0] === "set-task");
+	assert.ok(setTaskCall?.args.includes("--expect-etag=--help"));
+	assert.ok(!setTaskCall?.args.includes("--help"));
+});
+
+test("mutation outcome: a valid v1 receipt is completed", async () => {
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt({ command: "SetTask" }))));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "ok");
+	assert.equal(result.mutationOutcome, "completed");
+});
+
+test("mutation outcome: schema-valid junk is indeterminate, not success", async () => {
+	// exit 0, schema_version matches, but NOT a mutation receipt
+	const junk = JSON.stringify({ schema_version: "mdtools.v1", entries: [] });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, junk)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.match(result.error?.nextAction ?? "", /re-read/i);
+});
+
+test("mutation outcome: started nonzero exit WITHOUT an envelope is indeterminate (not failed-clean)", async () => {
+	// current binary, no error envelope on stdout, real nonzero exit code
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, "", { code: 101, stderr: "panic" })));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.equal(result.error?.code, "E_MD_COMMAND_ABORTED");
+	assert.notEqual(result.error?.code, "E_MD_COMMAND_FAILED");
+});
+
+test("mutation outcome: a valid v1 error envelope is a clean rejection", async () => {
+	const stdout = envelope("etag_mismatch", {}, { expected_etag: "aaaa", found_etag: "bbbb" });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, stdout, { code: 4 })));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "aaaa" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "rejected");
+	assert.equal(result.error?.code, "E_ETAG_MISMATCH");
+});
+
+test("mutation outcome: pre-start abort is not_started (untouched)", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, receipt())));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" }, controller.signal);
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
+	assert.equal(result.error?.code, "E_MD_COMMAND_ABORTED");
+});
+
+test("mutation outcome: exit-0 unparseable output is indeterminate", async () => {
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, "not json at all")));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
 });
 
 test("mutating tools issue exactly one md call — no pre-flight reads", async () => {

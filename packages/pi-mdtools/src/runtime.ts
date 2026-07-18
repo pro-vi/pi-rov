@@ -16,6 +16,7 @@ import type {
 	MdCommandRunner,
 	MdResultEnvelope,
 	MdtoolsStatus,
+	MutationOutcome,
 	MoveSectionParams,
 	OutlineParams,
 	ReplaceSectionParams,
@@ -268,11 +269,13 @@ function resultWithError(options: {
 	stderr?: string;
 	hint?: string;
 	nextAction?: string;
+	mutationOutcome?: MutationOutcome;
 }): MdResultEnvelope {
 	return {
 		status: options.status,
 		command: options.command,
 		...(options.file !== undefined ? { file: options.file } : {}),
+		...(options.mutationOutcome !== undefined ? { mutationOutcome: options.mutationOutcome } : {}),
 		...(options.candidates !== undefined ? { candidates: options.candidates } : {}),
 		error: mdError(options.code, options.message, {
 			...(options.exitCode !== undefined ? { exitCode: options.exitCode } : {}),
@@ -295,6 +298,7 @@ function unresolvedResultWithError(options: {
 	candidates?: MdCandidate[];
 	hint?: string;
 	nextAction?: string;
+	mutationOutcome?: MutationOutcome;
 }): MdResultEnvelope {
 	return resultWithError({
 		status: options.status,
@@ -306,6 +310,7 @@ function unresolvedResultWithError(options: {
 		...(options.candidates !== undefined ? { candidates: options.candidates } : {}),
 		...(options.hint !== undefined ? { hint: options.hint } : {}),
 		...(options.nextAction !== undefined ? { nextAction: options.nextAction } : {}),
+		...(options.mutationOutcome !== undefined ? { mutationOutcome: options.mutationOutcome } : {}),
 	});
 }
 
@@ -482,6 +487,7 @@ function legacyFailureResult(
 	file: string | undefined,
 	execution: MdCommandExecution,
 	legacyBinary: boolean,
+	mutationOutcome?: MutationOutcome,
 ): MdResultEnvelope {
 	const code: MdErrorCode =
 		execution.killed || execution.code === null
@@ -498,6 +504,7 @@ function legacyFailureResult(
 		message: errorMessage(execution),
 		exitCode: execution.code,
 		...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
+		...(mutationOutcome !== undefined ? { mutationOutcome } : {}),
 	});
 }
 
@@ -566,6 +573,39 @@ function taskCandidateFromEntry(entry: unknown): MdCandidate | undefined {
 		...(entry.span !== undefined ? { span: entry.span } : {}),
 		...(summary !== undefined && summary.length > 0 ? { snippet: summary } : {}),
 	};
+}
+
+/// The PascalCase MutationCommandKind / MutationDisposition values the Rust
+/// binary serializes in a MutationResult receipt (src/model.rs). Kept as a
+/// closed set so a schema-valid object that is NOT a receipt is rejected.
+const MUTATION_COMMAND_KINDS = new Set([
+	"ReplaceBlock",
+	"ReplaceSection",
+	"ReplaceTableRow",
+	"DeleteTableRow",
+	"InsertBlock",
+	"DeleteBlock",
+	"DeleteSection",
+	"SetFrontmatter",
+	"SetTask",
+	"MoveSection",
+]);
+const MUTATION_DISPOSITIONS = new Set(["NoChange", "Replaced", "Inserted", "Deleted"]);
+
+/// A schema-valid object is NOT automatically a mutation receipt. Validate the
+/// required MutationResult fields (Rust src/model.rs) while tolerating additive
+/// fields, so an exit-0 response that is JSON-but-not-a-receipt is classified
+/// indeterminate, never accepted as success. schema_version is already checked
+/// upstream before this runs.
+function isValidMutationReceipt(data: Record<string, unknown>): boolean {
+	if (typeof data.file !== "string" || data.file.length === 0) return false;
+	if (typeof data.command !== "string" || !MUTATION_COMMAND_KINDS.has(data.command)) return false;
+	if (typeof data.disposition !== "string" || !MUTATION_DISPOSITIONS.has(data.disposition)) return false;
+	if (typeof data.changed !== "boolean") return false;
+	if (typeof data.guarded !== "boolean") return false;
+	if (!isRecord(data.target)) return false;
+	if (!isRecord(data.invariant) || typeof data.invariant.preserves_non_target_bytes !== "boolean") return false;
+	return true;
 }
 
 function taskCandidatesFromData(data: Record<string, unknown>): MdCandidate[] | undefined {
@@ -736,7 +776,8 @@ export class MdtoolsRuntime {
 	async setTask(params: SetTaskParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = ["set-task", "--json", "--status", params.status, "-i"];
-		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
+		// =value form so an etag value can never re-enter option parsing.
+		if (params.expectEtag !== undefined) args.push(`--expect-etag=${params.expectEtag}`);
 		// `--` terminates option parsing: a loc (or any future free-form
 		// positional) can never be read as a clap flag.
 		args.push("--", params.loc, file);
@@ -805,7 +846,8 @@ export class MdtoolsRuntime {
 		const args = ["replace-section", "--json", "-i", "--from", contentPath];
 		if (params.ignoreCase === true) args.push("--ignore-case");
 		if (params.occurrence !== undefined) args.push("--occurrence", String(params.occurrence));
-		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
+		// =value form so an etag value can never re-enter option parsing.
+		if (params.expectEtag !== undefined) args.push(`--expect-etag=${params.expectEtag}`);
 		args.push("--", params.heading, file);
 		return args;
 	}
@@ -842,6 +884,9 @@ export class MdtoolsRuntime {
 			status: "ok",
 			command,
 			...(file !== undefined ? { file } : {}),
+			// status "ok" for a mutation means a validated v1 receipt was
+			// accepted — the only path that reaches here for mutating calls.
+			...(mutating ? { mutationOutcome: "completed" as MutationOutcome } : {}),
 			data: outcome.data,
 			meta: commandMeta(command, file, outcome.execution),
 		};
@@ -866,6 +911,7 @@ export class MdtoolsRuntime {
 					code: "E_MD_COMMAND_ABORTED",
 					message: "Aborted before the md command started; the file is untouched.",
 					nextAction: "The call was cancelled before md started; nothing changed. Retry if still wanted.",
+					...(mutating ? { mutationOutcome: "not_started" as MutationOutcome } : {}),
 				}),
 			};
 		}
@@ -888,6 +934,7 @@ export class MdtoolsRuntime {
 					code: "E_MD_COMMAND_ABORTED",
 					message: "Aborted before the md command started; the file is untouched.",
 					nextAction: "The call was cancelled before md started; nothing changed. Retry if still wanted.",
+					...(mutating ? { mutationOutcome: "not_started" as MutationOutcome } : {}),
 				}),
 			};
 		}
@@ -903,6 +950,7 @@ export class MdtoolsRuntime {
 					code: "E_MD_BINARY_MISSING",
 					message: "mdtools binary not found.",
 					hint: "Install mdtools so `md` is on PATH, or set MDTOOLS_MD_BIN to the md executable path.",
+					...(mutating ? { mutationOutcome: "not_started" as MutationOutcome } : {}),
 				}),
 			};
 		}
@@ -935,7 +983,10 @@ export class MdtoolsRuntime {
 						? `md exited 0 but its response could not be parsed; the mutation likely committed. ${parsed.message}`
 						: `Failed to parse md JSON output: ${parsed.message}`,
 					...(mutating
-						? { nextAction: "md exited 0, so the mutation almost certainly committed; re-read the file (md_outline/md_tasks) before any retry." }
+						? {
+								nextAction: "md exited 0, so the mutation almost certainly committed; re-read the file (md_outline/md_tasks) before any retry.",
+								mutationOutcome: "indeterminate" as MutationOutcome,
+							}
 						: {}),
 				}),
 			};
@@ -954,6 +1005,28 @@ export class MdtoolsRuntime {
 					meta: commandMeta(command, file, execution),
 					code: "E_MD_SCHEMA_MISMATCH",
 					message: `md returned schema_version ${JSON.stringify(schemaVersion ?? null)}; pi-mdtools requires ${MDTOOLS_SCHEMA_VERSION}.`,
+					// The process exited 0 but returned an untrusted shape: for a
+					// mutation the write may already have committed.
+					...(mutating ? { mutationOutcome: "indeterminate" as MutationOutcome } : {}),
+				}),
+			};
+		}
+
+		// A mutation is "completed" ONLY on a validated v1 receipt. Exit 0 with
+		// schema-valid-but-not-a-receipt JSON is indeterminate, never success —
+		// the write may have committed while the response was junk.
+		if (mutating && !isValidMutationReceipt(parsed.data)) {
+			return {
+				ok: false,
+				result: resultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					meta: commandMeta(command, file, execution),
+					code: "E_MD_JSON_PARSE",
+					message: "md exited 0 but did not return a valid mutation receipt; the mutation may have committed.",
+					nextAction: "md exited 0, so the mutation may have committed; re-read the file (md_outline/md_tasks) before any retry.",
+					mutationOutcome: "indeterminate",
 				}),
 			};
 		}
@@ -977,18 +1050,40 @@ export class MdtoolsRuntime {
 			// status (spawn/stream error): a started command is
 			// INDETERMINATE — a mutation may have fully committed (atomic
 			// writes are never partial), so the contract is re-read before
-			// retry, never failed-clean. `mutating` is part of the signature
-			// for symmetry with runJsonData; the classification is the same.
-			void mutating;
-			return legacyFailureResult(command, file, execution, false);
+			// retry, never failed-clean.
+			return legacyFailureResult(command, file, execution, false, mutating ? "indeterminate" : undefined);
 		}
 		const decoded = decodeBinaryErrorEnvelope(execution.stdout);
 		if (decoded === undefined) {
 			if (signal?.aborted) {
-				return legacyFailureResult(command, file, execution, false);
+				// Aborted mid-flight AFTER the process started: same indeterminacy.
+				return legacyFailureResult(command, file, execution, false, mutating ? "indeterminate" : undefined);
 			}
 			const handshake = await this.handshake();
-			return legacyFailureResult(command, file, execution, handshake.verdict !== "current");
+			const legacyBinary = handshake.verdict !== "current";
+			// A legacy binary's bare conflict exit (4) is a pre-write guard
+			// rejection on an old binary — untouched, not indeterminate.
+			if (legacyBinary && execution.code === 4) {
+				return legacyFailureResult(command, file, execution, true);
+			}
+			// A started MUTATION that exited nonzero without an authoritative
+			// v1 envelope is indeterminate, never failed-clean: the write may
+			// have committed (panic after the atomic rename, post-commit
+			// stdout failure). This is the merge-blocker fix.
+			if (mutating) {
+				return resultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					meta: commandMeta(command, file, execution),
+					code: "E_MD_COMMAND_ABORTED",
+					message: `md exited ${execution.code ?? "?"} without a structured result; the mutation may have committed.`,
+					exitCode: execution.code,
+					...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
+					mutationOutcome: "indeterminate",
+				});
+			}
+			return legacyFailureResult(command, file, execution, legacyBinary);
 		}
 		if (!decoded.schemaVersionOk) {
 			return resultWithError({
@@ -999,6 +1094,8 @@ export class MdtoolsRuntime {
 				code: "E_MD_SCHEMA_MISMATCH",
 				message: `md error envelope carried an unexpected schema_version; pi-mdtools requires ${MDTOOLS_SCHEMA_VERSION}.`,
 				exitCode: execution.code,
+				// A non-v1 error envelope is not an authoritative rejection.
+				...(mutating ? { mutationOutcome: "indeterminate" as MutationOutcome } : {}),
 			});
 		}
 
@@ -1042,6 +1139,9 @@ export class MdtoolsRuntime {
 			...(execution.stderr.trim().length > 0 ? { stderr: execution.stderr } : {}),
 			...(decoded.hint !== undefined ? { hint: decoded.hint } : {}),
 			...(nextAction !== undefined ? { nextAction } : {}),
+			// A validated v1 error envelope means the binary rejected the
+			// mutation before writing: authoritative, untouched.
+			...(mutating ? { mutationOutcome: "rejected" as MutationOutcome } : {}),
 		});
 		// Surface the structured context instead of discarding it — the
 		// adapter is a COMPLETE projection of the binary envelope. When the

@@ -1,5 +1,15 @@
 export type MdToolStatus = "ok" | "ambiguous" | "failed";
 export type TaskStatus = "pending" | "done";
+
+/// Lifecycle authority for a MUTATION call, owned by the Pi runtime (not the
+/// binary). Queries never carry one. The invariants (see the plan's
+/// State-Action Contracts):
+///   - status === "ok"            iff  mutationOutcome === "completed"
+///   - mutationOutcome === "indeterminate"  iff the process started and no
+///     authoritative v1 receipt/error envelope was accepted (re-read required)
+///   - "not_started" is only used when the mutation is proven never to have
+///     spawned (pre-spawn abort, unresolved binary) — the file is untouched.
+export type MutationOutcome = "not_started" | "rejected" | "completed" | "indeterminate";
 export type MovePlacement = "after" | "before" | "into";
 export type SectionLeveling = "auto" | "keep";
 
@@ -105,6 +115,8 @@ interface MdResultBase {
 	command: string;
 	file?: string;
 	meta: MdResultMeta;
+	/// Present only for mutation calls. See MutationOutcome for the invariants.
+	mutationOutcome?: MutationOutcome;
 }
 
 export type MdResultEnvelope<TData = unknown> =

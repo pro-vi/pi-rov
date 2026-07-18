@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { MutationOutcome } from "./types.js";
+
 /// pi-mdtools usage instrumentation: one JSONL line per md_* tool call.
 ///
 /// The schema is CONSUMER-GENERIC by contract: no bench task IDs, modes, or
@@ -46,6 +48,9 @@ export interface UsageLine {
 	guarded: boolean;
 	/// Cross-check from a successful MutationResult.guarded, when present.
 	guardedResult?: boolean;
+	/// Lifecycle authority for mutation calls (completed | rejected |
+	/// indeterminate | not_started); absent for queries.
+	mutationOutcome?: MutationOutcome;
 	/// Query on a file previously mutated in this session (the re-query
 	/// pattern the tool is designed around).
 	requeried: boolean;
@@ -95,6 +100,7 @@ export class UsageTracker {
 		guardedResult?: boolean;
 		ok: boolean;
 		errorCode?: string;
+		mutationOutcome?: MutationOutcome;
 		durationMs: number;
 		outputBytes: number;
 		now?: Date;
@@ -102,7 +108,14 @@ export class UsageTracker {
 		const kind = TOOL_KIND[input.tool] ?? "query";
 		const requeried =
 			kind === "query" && input.resolvedPath !== undefined && this.mutatedFiles.has(input.resolvedPath);
-		if (kind === "mutation" && input.ok && input.resolvedPath !== undefined) {
+		// A file is "mutated" (so later reads are re-queries) when the write
+		// completed OR is indeterminate (may have committed) — never inferred
+		// from status alone. Fall back to ok only when no outcome is supplied.
+		const mayHaveMutated =
+			input.mutationOutcome !== undefined
+				? input.mutationOutcome === "completed" || input.mutationOutcome === "indeterminate"
+				: input.ok;
+		if (kind === "mutation" && input.resolvedPath !== undefined && mayHaveMutated) {
 			this.mutatedFiles.add(input.resolvedPath);
 		}
 		const fileHash = hashFileRef(input.resolvedPath);
@@ -116,6 +129,7 @@ export class UsageTracker {
 			...(input.errorCode !== undefined ? { errorCode: input.errorCode } : {}),
 			guarded: input.guarded,
 			...(input.guardedResult !== undefined ? { guardedResult: input.guardedResult } : {}),
+			...(input.mutationOutcome !== undefined ? { mutationOutcome: input.mutationOutcome } : {}),
 			requeried,
 			durationMs: Math.round(input.durationMs),
 			outputBytes: input.outputBytes,

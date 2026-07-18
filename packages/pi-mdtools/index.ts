@@ -38,6 +38,7 @@ async function tracked(
 			...(guardedResult !== undefined ? { guardedResult } : {}),
 			ok: envelope.status === "ok",
 			...(envelope.status !== "ok" && envelope.error !== undefined ? { errorCode: envelope.error.code } : {}),
+			...(envelope.mutationOutcome !== undefined ? { mutationOutcome: envelope.mutationOutcome } : {}),
 			durationMs: performance.now() - start,
 			outputBytes: rendered.content[0]?.text.length ?? 0,
 		}),
