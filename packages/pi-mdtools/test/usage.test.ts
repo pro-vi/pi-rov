@@ -13,11 +13,11 @@ test("every registered tool has a static kind", () => {
 	}
 });
 
-test("requeried fires on a query after a successful mutation of the same file", () => {
+test("requeried fires only for the SAME resolved file, not same basenames", () => {
 	const tracker = new UsageTracker();
 	const mutation = tracker.buildLine({
 		tool: "md_set_task",
-		file: "/work/notes.md",
+		resolvedPath: "/work/notes.md",
 		guarded: true,
 		ok: true,
 		durationMs: 5,
@@ -28,7 +28,7 @@ test("requeried fires on a query after a successful mutation of the same file", 
 
 	const requery = tracker.buildLine({
 		tool: "md_tasks",
-		file: "/elsewhere/notes.md", // same basename -> same hash bucket
+		resolvedPath: "/work/notes.md",
 		guarded: false,
 		ok: true,
 		durationMs: 3,
@@ -36,9 +36,20 @@ test("requeried fires on a query after a successful mutation of the same file", 
 	});
 	assert.equal(requery.requeried, true);
 
+	// same basename, different directory: NOT a re-query (review M9)
+	const sameBasenameElsewhere = tracker.buildLine({
+		tool: "md_tasks",
+		resolvedPath: "/elsewhere/notes.md",
+		guarded: false,
+		ok: true,
+		durationMs: 3,
+		outputBytes: 50,
+	});
+	assert.equal(sameBasenameElsewhere.requeried, false);
+
 	const otherFile = tracker.buildLine({
 		tool: "md_tasks",
-		file: "/work/other.md",
+		resolvedPath: "/work/other.md",
 		guarded: false,
 		ok: true,
 		durationMs: 3,
@@ -51,7 +62,7 @@ test("failed mutations do not mark the file as mutated", () => {
 	const tracker = new UsageTracker();
 	tracker.buildLine({
 		tool: "md_replace_section",
-		file: "/work/doc.md",
+		resolvedPath: "/work/doc.md",
 		guarded: true,
 		ok: false,
 		errorCode: "E_ETAG_MISMATCH",
@@ -60,7 +71,7 @@ test("failed mutations do not mark the file as mutated", () => {
 	});
 	const query = tracker.buildLine({
 		tool: "md_outline",
-		file: "/work/doc.md",
+		resolvedPath: "/work/doc.md",
 		guarded: false,
 		ok: true,
 		durationMs: 2,
@@ -73,7 +84,7 @@ test("lines carry no paths or content: file is an 8-char basename hash", () => {
 	const tracker = new UsageTracker();
 	const line = tracker.buildLine({
 		tool: "md_section",
-		file: "/very/secret/path/Design Notes.md",
+		resolvedPath: "/very/secret/path/Design Notes.md",
 		guarded: false,
 		ok: true,
 		durationMs: 1,
@@ -84,7 +95,10 @@ test("lines carry no paths or content: file is an 8-char basename hash", () => {
 	assert.ok(!serialized.includes("Design Notes"), "no basename plaintext");
 	assert.match(line.fileHash ?? "", /^[0-9a-f]{8}$/);
 	assert.equal(line.schema, USAGE_SCHEMA);
-	assert.equal(hashFileRef("/a/Design Notes.md"), line.fileHash);
+	assert.match(line.session, /^[0-9a-f-]{36}$/);
+	assert.equal(hashFileRef("/very/secret/path/Design Notes.md"), line.fileHash);
+	// distinct directories, same basename -> distinct hashes
+	assert.notEqual(hashFileRef("/a/Design Notes.md"), line.fileHash);
 });
 
 test("kill switch disables the sink; explicit path wins", async () => {
@@ -99,7 +113,7 @@ test("record appends parseable JSONL to the configured sink", async () => {
 	const tracker = new UsageTracker();
 	const line = tracker.buildLine({
 		tool: "md_tasks",
-		file: "doc.md",
+		resolvedPath: "/work/doc.md",
 		guarded: false,
 		ok: true,
 		durationMs: 2,

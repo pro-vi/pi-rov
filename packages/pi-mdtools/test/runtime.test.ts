@@ -345,3 +345,45 @@ test("binary resolution precedence: MD_BINARY_PATH > MDTOOLS_MD_BIN > PATH", asy
 	res = await resolveMdBinary({ cwd: dir, env: { PATH: pathDir } });
 	assert.equal(res.path, onPath);
 });
+
+test("a pre-aborted signal never spawns md and reports untouched", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	const { runtime, calls } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, "{}")));
+	const result = await runtime.setTask({ file: "doc.md", loc: "0.0", status: "done" }, controller.signal);
+	assert.equal(result.error?.code, "E_MD_COMMAND_ABORTED");
+	assert.match(result.error?.nextAction ?? "", /untouched|nothing changed/i);
+	assert.equal(calls.length, 0, "no md process may be spawned after cancellation");
+});
+
+test("handshake re-probes when the resolved binary identity changes", async () => {
+	// Before the explicit binary exists, resolution falls back to whatever md
+	// the machine has (PATH/fallback dirs) — the fake runner reports THAT
+	// identity as legacy. Once the explicit binary appears, resolution flips
+	// to it and the cached legacy verdict must be re-probed, not pinned.
+	const { mkdtemp: makeTemp, writeFile: write, chmod } = await import("node:fs/promises");
+	const dir = await makeTemp(join(import.meta.dirname, "../node_modules/.tmp-hs-"));
+	const binPath = join(dir, "md");
+
+	let schemaCalls = 0;
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") {
+			schemaCalls += 1;
+			return execution(request, request.binary === binPath ? SCHEMA_OK : SCHEMA_LEGACY_CAPS);
+		}
+		return execution(request, "{}");
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: binPath, runner });
+
+	const before = await runtime.handshake();
+	assert.notEqual(before.verdict, "current", "system fallback binary must not read current");
+
+	// install the explicit binary mid-session: the cached verdict must flip
+	await write(binPath, "#!/bin/sh\nexit 0\n", "utf8");
+	await chmod(binPath, 0o755);
+	assert.equal((await runtime.handshake()).verdict, "current");
+	// and stays cached for the same identity
+	const probesAfterFlip = schemaCalls;
+	assert.equal((await runtime.handshake()).verdict, "current");
+	assert.equal(schemaCalls, probesAfterFlip);
+});

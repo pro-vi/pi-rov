@@ -68,6 +68,10 @@ export interface MdErrorInfo {
 	exitCode?: number | null;
 	stderr?: string;
 	hint?: string;
+	/// Structured etag/loc context projected from the binary's envelope.
+	expectedEtag?: string;
+	foundEtag?: string;
+	loc?: string;
 }
 
 export interface MdCandidate {

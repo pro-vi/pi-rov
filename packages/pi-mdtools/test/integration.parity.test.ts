@@ -76,11 +76,17 @@ test("parity: every subcommand and flag the adapter emits exists in md schema", 
 		if (subcommand === "schema") continue;
 		const known = flagsByCommand.get(subcommand as string);
 		assert.ok(known !== undefined, `adapter emits unknown subcommand ${subcommand}`);
+		let optionsTerminated = false;
 		for (const arg of rest) {
-			if (!arg.startsWith("--")) continue;
+			if (arg === "--") {
+				optionsTerminated = true;
+				continue;
+			}
+			if (optionsTerminated || !arg.startsWith("--")) continue;
+			const flagName = arg.split("=")[0] as string;
 			assert.ok(
-				known.has(arg) || globalFlags.has(arg),
-				`adapter emits ${subcommand} flag ${arg} that md schema does not list`,
+				known.has(flagName) || globalFlags.has(flagName),
+				`adapter emits ${subcommand} flag ${flagName} that md schema does not list`,
 			);
 		}
 	}
@@ -138,6 +144,12 @@ test("parity: behavioral roundtrips hit the exact adapter codes", { skip: !enabl
 	const accents = join(dir, "accents.md");
 	await writeFile(accents, "# CAFÉ\n\nbody\n", "utf8");
 	result = await runtime.section({ file: accents, heading: "café", ignoreCase: true });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+
+	// a heading literally named "--help" is a selector, never a clap flag (M8)
+	const hyphens = join(dir, "hyphens.md");
+	await writeFile(hyphens, "# --help\n\nflag-shaped heading\n", "utf8");
+	result = await runtime.section({ file: hyphens, heading: "--help" });
 	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
 
 	// bad loc -> E_BAD_LOC with current task candidates
