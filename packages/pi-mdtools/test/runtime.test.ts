@@ -467,3 +467,86 @@ test("handshake re-probes when the resolved binary identity changes", async () =
 	assert.equal((await runtime.handshake()).verdict, "current");
 	assert.equal(schemaCalls, probesAfterFlip);
 });
+
+test("in-place replacement with same size and restored mtime still invalidates (ctimeNs)", async () => {
+	const { mkdtemp: makeTemp, writeFile: write, readFile: read, chmod, utimes, stat: statFile } = await import("node:fs/promises");
+	const dir = await makeTemp(join(import.meta.dirname, "../node_modules/.tmp-id-"));
+	const binPath = join(dir, "md");
+	const legacyBody = "#!/bin/sh\nOLD\n";
+	const currentBody = "#!/bin/sh\nNEW\n"; // identical byte length, same inode after rewrite
+	assert.equal(legacyBody.length, currentBody.length);
+	await write(binPath, legacyBody, "utf8");
+	await chmod(binPath, 0o755);
+	const original = await statFile(binPath);
+
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") {
+			const body = await read(binPath, "utf8");
+			return execution(request, body.includes("NEW") ? SCHEMA_OK : SCHEMA_LEGACY_CAPS);
+		}
+		return execution(request, "{}");
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: binPath, runner });
+	assert.notEqual((await runtime.handshake()).verdict, "current");
+
+	// Overwrite in place (same inode, same size), then restore the old mtime:
+	// the attacker's "looks unchanged" move. ctime cannot be set back, so the
+	// identity key must still change and force a re-probe.
+	await write(binPath, currentBody, "utf8");
+	await utimes(binPath, original.atime, original.mtime);
+	assert.equal((await runtime.handshake()).verdict, "current", "ctime change must force a re-probe despite restored mtime + same size");
+});
+
+test("a churning binary yields an unstable pre-start result and never spawns a mutation", async () => {
+	const { mkdtemp: makeTemp, writeFile: write, chmod } = await import("node:fs/promises");
+	const dir = await makeTemp(join(import.meta.dirname, "../node_modules/.tmp-churn-"));
+	const binPath = join(dir, "md");
+	await write(binPath, "#!/bin/sh\nexit 0\n", "utf8");
+	await chmod(binPath, 0o755);
+
+	let counter = 0;
+	const mutationSpawns: string[] = [];
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") {
+			// self-replace DURING every probe so identity never stabilizes
+			counter += 1;
+			await write(binPath, `#!/bin/sh\n# rev ${counter}\nexit 0\n`, "utf8");
+			return execution(request, SCHEMA_OK);
+		}
+		mutationSpawns.push(request.args[0] as string);
+		return execution(request, receipt());
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: binPath, runner });
+	const result = await runtime.setTask({ file: "doc.md", loc: "0.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
+	assert.equal(mutationSpawns.length, 0, "a churning binary must never spawn the mutation");
+});
+
+test("status reports the resolution it actually probed (one observation)", async () => {
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, "{}")));
+	const status = await runtime.status();
+	assert.equal(status.binary.found, true);
+	assert.equal(status.handshake?.verdict, "current");
+});
+
+test("recovery classification and enrichment reuse the observed context (no re-resolve/re-handshake)", async () => {
+	// Encodes U2's verification: no fresh resolveBinary() or handshake() occurs
+	// inside failure classification or enrichment. acquireStableContext (which
+	// legitimately resolves) is defined ABOVE tryReadJson, so it is excluded.
+	const source = await readFile(join(import.meta.dirname, "../src/runtime.ts"), "utf8");
+	// tryReadJson body (enrichment): up to the next method.
+	const tryReadStart = source.indexOf("private async tryReadJson");
+	const tryReadBody = source.slice(tryReadStart, source.indexOf("private async runJson", tryReadStart));
+	// failureResult body (classification): to end of class.
+	const failureBody = source.slice(source.indexOf("private async failureResult"));
+	for (const [name, body] of [
+		["tryReadJson", tryReadBody],
+		["failureResult", failureBody],
+	] as const) {
+		assert.ok(body.length > 0, `${name} region not found`);
+		assert.ok(!body.includes("this.resolveBinary("), `${name} must not re-resolve the binary`);
+		assert.ok(!body.includes("this.handshake("), `${name} must not re-handshake`);
+		assert.ok(!body.includes("this.acquireStableContext("), `${name} must reuse the passed context, not acquire a new one`);
+	}
+});

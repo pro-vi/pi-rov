@@ -71,6 +71,17 @@ export interface MdtoolsStatus {
 	handshake?: MdHandshake;
 }
 
+/// One observed binary context, stable across the schema probe: the resolution
+/// actually probed, its handshake verdict, and the content-identity key that
+/// held from before the probe through the pre-spawn checkpoint. Execution,
+/// failure classification, and recovery enrichment all reuse THIS — they never
+/// independently re-resolve or re-handshake a possibly-different binary.
+export interface ObservedContext {
+	resolution: MdBinaryResolution;
+	handshake: MdHandshake;
+	identityKey: string;
+}
+
 export interface MdErrorInfo {
 	code: MdErrorCode;
 	message: string;

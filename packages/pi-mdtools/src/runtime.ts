@@ -17,6 +17,7 @@ import type {
 	MdResultEnvelope,
 	MdtoolsStatus,
 	MutationOutcome,
+	ObservedContext,
 	MoveSectionParams,
 	OutlineParams,
 	ReplaceSectionParams,
@@ -647,37 +648,64 @@ export class MdtoolsRuntime {
 		return await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
 	}
 
-	/// Identity is content identity, not a pathname: dev/ino/mtime/size are
-	/// part of the cache key, so replacing the binary IN PLACE invalidates a
-	/// cached verdict just like installing at a new path does.
+	/// Bounded reacquisition attempts before a churning binary is reported as
+	/// an unstably-observed pre-start failure (never a mutation spawn).
+	private readonly maxIdentityAttempts = 3;
+
+	/// Identity is CONTENT identity, not a pathname: dev/ino/size plus
+	/// nanosecond mtime AND ctime are part of the key. ctimeNs closes the
+	/// same-size + restored-mtime bypass — ctime cannot be set back without
+	/// clock manipulation, so any in-place replacement changes the key.
 	private async binaryIdentityKey(resolution: MdBinaryResolution): Promise<string> {
 		if (!resolution.found || resolution.path === undefined) return "<missing>";
 		try {
-			const s = await stat(resolution.path);
-			return `${resolution.path}:${s.dev}:${s.ino}:${Math.trunc(s.mtimeMs)}:${s.size}`;
+			const s = await stat(resolution.path, { bigint: true });
+			return `${resolution.path}:${s.dev}:${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
 		} catch {
 			return `${resolution.path}:<unstattable>`;
 		}
 	}
 
 	async status(): Promise<MdtoolsStatus> {
-		return {
-			binary: await this.resolveBinary(),
-			cwd: this.cwd,
-			handshake: await this.handshake(),
-		};
+		// Report the resolution actually probed — one observation, not a
+		// separate resolve + separate handshake that could disagree.
+		const observed = await this.acquireStableContext();
+		if (observed === undefined) {
+			return { binary: await this.resolveBinary(), cwd: this.cwd, handshake: { verdict: "legacy" } };
+		}
+		return { binary: observed.resolution, cwd: this.cwd, handshake: observed.handshake };
 	}
 
-	/// Probe `md schema --json` once per RESOLVED BINARY IDENTITY
-	/// (path + dev/ino/mtime/size). Re-resolved and re-statted on every call,
-	/// so installing, swapping, or in-place replacing md invalidates a cached
-	/// missing/legacy verdict. Transient probe failures (killed / no exit
-	/// status) are never cached. "current" requires the schema version AND
-	/// the required capability set. Returns the resolution it verified so
-	/// callers execute the exact binary that was handshaken.
-	async handshakeBound(): Promise<{ resolution: MdBinaryResolution; handshake: MdHandshake }> {
-		const resolution = await this.resolveBinary();
-		const key = await this.binaryIdentityKey(resolution);
+	/// Acquire ONE observed binary context whose content identity held from
+	/// before the `md schema` probe through the pre-spawn checkpoint. If the
+	/// binary is swapped in that window (in-place replacement, self-replacement
+	/// during the probe) the identity key changes, the untrustworthy verdict is
+	/// dropped, and we reacquire — bounded by maxIdentityAttempts. Returns
+	/// undefined only when the binary keeps churning (an unstable observation),
+	/// so callers can fail closed pre-start instead of executing a moving
+	/// target. The residual stat-check→spawn race is a documented non-goal.
+	private async acquireStableContext(): Promise<ObservedContext | undefined> {
+		for (let attempt = 0; attempt < this.maxIdentityAttempts; attempt += 1) {
+			const resolution = await this.resolveBinary();
+			const keyBefore = await this.binaryIdentityKey(resolution);
+			const handshake = await this.probeFor(resolution, keyBefore);
+			// Re-stat the SAME resolved path: unchanged from before the probe
+			// through here means the verdict describes the binary we will run.
+			const keyAfter = await this.binaryIdentityKey(resolution);
+			if (keyBefore === keyAfter) {
+				return { resolution, handshake, identityKey: keyBefore };
+			}
+			// Swapped during the probe: the cached verdict is untrustworthy.
+			if (this.handshakeCache?.key === keyBefore) this.handshakeCache = undefined;
+		}
+		return undefined;
+	}
+
+	/// Probe `md schema --json` once per RESOLVED BINARY IDENTITY, caching by
+	/// the content-identity key. Transient probe failures (killed / no exit
+	/// status) are never cached. "current" requires the schema version AND the
+	/// required capability set.
+	private async probeFor(resolution: MdBinaryResolution, key: string): Promise<MdHandshake> {
 		if (this.handshakeCache === undefined || this.handshakeCache.key !== key) {
 			this.handshakeCache = { key, promise: this.probeHandshake(resolution) };
 		}
@@ -686,11 +714,12 @@ export class MdtoolsRuntime {
 		if (!probed.cacheable && this.handshakeCache === cacheEntry) {
 			this.handshakeCache = undefined;
 		}
-		return { resolution, handshake: probed.handshake };
+		return probed.handshake;
 	}
 
 	async handshake(): Promise<MdHandshake> {
-		return (await this.handshakeBound()).handshake;
+		const observed = await this.acquireStableContext();
+		return observed?.handshake ?? { verdict: "legacy" };
 	}
 
 	private async probeHandshake(
@@ -852,12 +881,17 @@ export class MdtoolsRuntime {
 		return args;
 	}
 
-	/// Best-effort structural read for failure-candidate enrichment. Raw
-	/// runner + parse; any failure returns undefined (never recursive, never
-	/// masks the original error).
-	private async tryReadJson(args: string[], signal: AbortSignal | undefined): Promise<Record<string, unknown> | undefined> {
+	/// Best-effort structural read for failure-candidate enrichment. Runs the
+	/// SAME observed binary that produced the failure — never re-resolves a
+	/// possibly-different one. Raw runner + parse; any failure returns
+	/// undefined (never recursive, never masks the original error).
+	private async tryReadJson(
+		args: string[],
+		signal: AbortSignal | undefined,
+		observed: ObservedContext,
+	): Promise<Record<string, unknown> | undefined> {
 		if (signal?.aborted) return undefined;
-		const resolution = await this.resolveBinary();
+		const resolution = observed.resolution;
 		if (!resolution.found || resolution.path === undefined) return undefined;
 		const execution = await this.runner({
 			binary: resolution.path,
@@ -915,12 +949,30 @@ export class MdtoolsRuntime {
 				}),
 			};
 		}
-		// Bind this call to one verified binary identity (cached; re-resolved
-		// and re-statted so a mid-session install/swap/replace invalidates
-		// the verdict) — and execute THAT resolution, not a fresh one.
-		const bound = await this.handshakeBound();
-		const resolution = bound.resolution;
-		// The handshake await is a suspension point: re-check cancellation
+		// Observe ONE stable binary context (identity held from before the
+		// schema probe through the pre-spawn checkpoint). Execution, failure
+		// classification, and enrichment all reuse it — no second resolve.
+		const observed = await this.acquireStableContext();
+		if (observed === undefined) {
+			// The binary kept changing under us: never spawn a mutation against
+			// a moving target — report an unstable, pre-start (untouched) state.
+			return {
+				ok: false,
+				result: unresolvedResultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					args,
+					cwd: this.cwd,
+					code: "E_MD_COMMAND_ABORTED",
+					message: "The md binary changed repeatedly while resolving its identity; nothing was run.",
+					nextAction: "The md binary is being replaced mid-session; wait for the install to settle, then retry.",
+					...(mutating ? { mutationOutcome: "not_started" as MutationOutcome } : {}),
+				}),
+			};
+		}
+		const resolution = observed.resolution;
+		// The context await is a suspension point: re-check cancellation
 		// before any spawn so pre-start abort still implies untouched.
 		if (signal?.aborted) {
 			return {
@@ -963,7 +1015,7 @@ export class MdtoolsRuntime {
 			...(signal !== undefined ? { signal } : {}),
 		});
 		if (execution.killed || execution.code !== 0 || execution.code === null) {
-			return { ok: false, result: await this.failureResult(command, file, execution, signal, mutating) };
+			return { ok: false, result: await this.failureResult(command, file, execution, signal, mutating, observed) };
 		}
 
 		const parsed = parseJsonObject(execution.stdout);
@@ -1043,7 +1095,8 @@ export class MdtoolsRuntime {
 		file: string | undefined,
 		execution: MdCommandExecution,
 		signal: AbortSignal | undefined,
-		mutating = false,
+		mutating: boolean,
+		observed: ObservedContext,
 	): Promise<MdResultEnvelope> {
 		if (execution.killed || execution.code === null) {
 			// Killed, or the process ended without an authoritative exit
@@ -1059,8 +1112,9 @@ export class MdtoolsRuntime {
 				// Aborted mid-flight AFTER the process started: same indeterminacy.
 				return legacyFailureResult(command, file, execution, false, mutating ? "indeterminate" : undefined);
 			}
-			const handshake = await this.handshake();
-			const legacyBinary = handshake.verdict !== "current";
+			// Reuse the SAME observed context — never re-resolve or re-handshake
+			// a possibly-different binary inside failure classification.
+			const legacyBinary = observed.handshake.verdict !== "current";
 			// A legacy binary's bare conflict exit (4) is a pre-write guard
 			// rejection on an old binary — untouched, not indeterminate.
 			if (legacyBinary && execution.code === 4) {
@@ -1109,10 +1163,10 @@ export class MdtoolsRuntime {
 				line: m.line,
 			}));
 		} else if (decoded.errorCode === "E_HEADING_NOT_FOUND" && file !== undefined) {
-			const outline = await this.tryReadJson(["outline", "--json", file], signal);
+			const outline = await this.tryReadJson(["outline", "--json", file], signal, observed);
 			if (outline !== undefined) candidates = headingListingFromOutline(outline, role);
 		} else if (decoded.errorCode === "E_BAD_LOC" && file !== undefined) {
-			const tasks = await this.tryReadJson(["tasks", "--json", file], signal);
+			const tasks = await this.tryReadJson(["tasks", "--json", file], signal, observed);
 			if (tasks !== undefined) {
 				const taskCandidates = taskCandidatesFromData(tasks);
 				if (taskCandidates !== undefined) candidates = taskCandidates;
