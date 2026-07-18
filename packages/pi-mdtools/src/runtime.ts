@@ -227,7 +227,8 @@ const DEFAULT_NEXT_ACTIONS: Record<MdErrorCode, string> = {
 	E_MD_COMMAND_FAILED: "Read error.stderr for the mdtools failure, refresh the structural target with the relevant md_* read tool, then retry.",
 	E_MD_JSON_PARSE: "Run /mdtools status to confirm the md binary, then retry or inspect the md command output outside Pi.",
 	E_MD_SCHEMA_MISMATCH: "Upgrade mdtools or re-run the matching md_* read tool; the installed md JSON shape did not match pi-mdtools expectations.",
-	E_ETAG_MISMATCH: "Re-read md_blocks for current etags, then retry with the fresh expectEtag.",
+	E_ETAG_MISMATCH:
+		"Re-read the matching md_* read tool (md_outline/md_section for sections, md_tasks for tasks, md_blocks for blocks) and retry with the fresh expectEtag.",
 	E_ETAG_UNAVAILABLE: "Upgrade mdtools to a version whose md blocks --json includes per-block etag fields, or retry without expectEtag if drift safety is not required.",
 	E_HEADING_NOT_FOUND: "Run md_outline for the current heading tree, then retry with an exact heading text.",
 	E_AMBIGUOUS_HEADING: "Choose one candidates[].occurrence value and retry with occurrence, sourceOccurrence, or destinationOccurrence as appropriate.",
@@ -410,6 +411,9 @@ export const spawnMdCommand: MdCommandRunner = async (request: MdCommandRequest)
 		};
 
 		request.signal?.addEventListener("abort", abort, { once: true });
+		// A listener on an already-aborted signal never fires: re-check after
+		// registering so a queued call cancelled while waiting cannot commit.
+		if (request.signal?.aborted) terminate("abort");
 
 		child.stdout.setEncoding("utf8");
 		child.stderr.setEncoding("utf8");
@@ -587,27 +591,35 @@ export class MdtoolsRuntime {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	}
 
-	private handshakePromise: Promise<MdHandshake> | undefined;
+	private handshakeCache: { key: string; promise: Promise<MdHandshake> } | undefined;
+
+	private async resolveBinary(): Promise<MdBinaryResolution> {
+		return await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+	}
 
 	async status(): Promise<MdtoolsStatus> {
 		return {
-			binary: await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) }),
+			binary: await this.resolveBinary(),
 			cwd: this.cwd,
 			handshake: await this.handshake(),
 		};
 	}
 
-	/// One-shot per runtime (the runtime is session-scoped): probe
-	/// `md schema --json`. "current" requires the schema version AND the
-	/// required capability set; version-match-with-missing-capability is
-	/// "legacy".
+	/// Probe `md schema --json` once per RESOLVED BINARY IDENTITY. The
+	/// resolution itself is re-checked on every handshake call (cheap fs
+	/// stats), so installing or swapping md mid-session invalidates a cached
+	/// missing/legacy verdict instead of pinning it forever. "current"
+	/// requires the schema version AND the required capability set.
 	async handshake(): Promise<MdHandshake> {
-		this.handshakePromise ??= this.probeHandshake();
-		return await this.handshakePromise;
+		const resolution = await this.resolveBinary();
+		const key = resolution.found && resolution.path !== undefined ? resolution.path : "<missing>";
+		if (this.handshakeCache === undefined || this.handshakeCache.key !== key) {
+			this.handshakeCache = { key, promise: this.probeHandshake(resolution) };
+		}
+		return await this.handshakeCache.promise;
 	}
 
-	private async probeHandshake(): Promise<MdHandshake> {
-		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+	private async probeHandshake(resolution: MdBinaryResolution): Promise<MdHandshake> {
 		if (!resolution.found || resolution.path === undefined) return { verdict: "missing" };
 		const execution = await this.runner({
 			binary: resolution.path,
@@ -720,7 +732,9 @@ export class MdtoolsRuntime {
 		const args = ["section", "--json"];
 		if (params.ignoreCase === true) args.push("--ignore-case");
 		if (params.occurrence !== undefined) args.push("--occurrence", String(params.occurrence));
-		args.push(params.heading, file);
+		// `--` terminates option parsing: a heading literally named "--help"
+		// is a selector, never a flag.
+		args.push("--", params.heading, file);
 		return args;
 	}
 
@@ -731,7 +745,10 @@ export class MdtoolsRuntime {
 		if (params.destinationOccurrence !== undefined) args.push("--dest-occurrence", String(params.destinationOccurrence));
 		if (params.leveling === "keep") args.push("--keep-level");
 		else args.push("--auto-level");
-		args.push(`--${params.placement}`, params.destination, params.source, file);
+		// Destination rides as --flag=value so a hyphen-leading destination
+		// cannot be parsed as an option; `--` guards source/file positionals.
+		args.push(`--${params.placement}=${params.destination}`);
+		args.push("--", params.source, file);
 		return args;
 	}
 
@@ -740,7 +757,7 @@ export class MdtoolsRuntime {
 		if (params.ignoreCase === true) args.push("--ignore-case");
 		if (params.occurrence !== undefined) args.push("--occurrence", String(params.occurrence));
 		if (params.expectEtag !== undefined) args.push("--expect-etag", params.expectEtag);
-		args.push(params.heading, file);
+		args.push("--", params.heading, file);
 		return args;
 	}
 
@@ -749,7 +766,7 @@ export class MdtoolsRuntime {
 	/// masks the original error).
 	private async tryReadJson(args: string[], signal: AbortSignal | undefined): Promise<Record<string, unknown> | undefined> {
 		if (signal?.aborted) return undefined;
-		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+		const resolution = await this.resolveBinary();
 		if (!resolution.found || resolution.path === undefined) return undefined;
 		const execution = await this.runner({
 			binary: resolution.path,
@@ -786,7 +803,25 @@ export class MdtoolsRuntime {
 		file: string | undefined,
 		signal: AbortSignal | undefined,
 	): Promise<RunJsonOutcome> {
-		const resolution = await resolveMdBinary({ cwd: this.cwd, env: this.env, ...(this.binary !== undefined ? { explicit: this.binary } : {}) });
+		if (signal?.aborted) {
+			return {
+				ok: false,
+				result: unresolvedResultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					args,
+					cwd: this.cwd,
+					code: "E_MD_COMMAND_ABORTED",
+					message: "Aborted before the md command started; the file is untouched.",
+					nextAction: "The call was cancelled before md started; nothing changed. Retry if still wanted.",
+				}),
+			};
+		}
+		// Bind this call to one verified binary identity (cached; re-resolved
+		// so a mid-session install or swap invalidates the verdict).
+		await this.handshake();
+		const resolution = await this.resolveBinary();
 		if (!resolution.found || resolution.path === undefined) {
 			return {
 				ok: false,
@@ -864,6 +899,9 @@ export class MdtoolsRuntime {
 		}
 		const decoded = decodeBinaryErrorEnvelope(execution.stdout);
 		if (decoded === undefined) {
+			if (signal?.aborted) {
+				return legacyFailureResult(command, file, execution, false);
+			}
 			const handshake = await this.handshake();
 			return legacyFailureResult(command, file, execution, handshake.verdict !== "current");
 		}
@@ -900,12 +938,14 @@ export class MdtoolsRuntime {
 		}
 
 		const occurrenceParam = occurrenceParamForRole(decoded.role);
-		let nextAction: string | undefined;
+		// The binary's remediation is authoritative; the adapter only
+		// re-words occurrence advice into tool parameter names.
+		let nextAction: string | undefined = decoded.hint;
 		if (decoded.errorCode === "E_AMBIGUOUS_HEADING" || decoded.errorCode === "E_OCCURRENCE_OUT_OF_RANGE") {
 			nextAction = `Choose one candidates[].occurrence value and retry with ${occurrenceParam}.`;
 		}
 
-		return resultWithError({
+		const result = resultWithError({
 			status: decoded.status,
 			command,
 			...(file !== undefined ? { file } : {}),
@@ -918,5 +958,12 @@ export class MdtoolsRuntime {
 			...(decoded.hint !== undefined ? { hint: decoded.hint } : {}),
 			...(nextAction !== undefined ? { nextAction } : {}),
 		});
+		// Surface the structured etag/loc context instead of discarding it.
+		if (result.error !== undefined) {
+			if (decoded.expectedEtag !== undefined) result.error.expectedEtag = decoded.expectedEtag;
+			if (decoded.foundEtag !== undefined) result.error.foundEtag = decoded.foundEtag;
+			if (decoded.loc !== undefined) result.error.loc = decoded.loc;
+		}
+		return result;
 	}
 }
