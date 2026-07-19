@@ -746,14 +746,20 @@ function sectionRefMatches(ref: unknown, expect: SelectorExpectation | undefined
 }
 
 /// A schema-valid object is NOT automatically a mutation receipt, and a valid
-/// receipt for SOME mutation is not authoritative for THIS one. Validate the
-/// required MutationResult wire shape (Rust src/model.rs) — tolerating ADDITIVE
-/// fields only — AND bind it to the request: command kind, file, guard state,
-/// disposition/changed consistency, content===null (every adapter mutation is
-/// in-place), well-formed required/optional spans with u32 bounds, and the
-/// COMMAND-SPECIFIC target identity (loc / full section selector tuple /
-/// source+destination selectors + placement). Anything else is indeterminate,
-/// never accepted as success. schema_version is checked upstream.
+/// receipt for SOME mutation is not authoritative for THIS one. This validates a
+/// LOAD-BEARING SUBSET of the Rust MutationResult shape (src/model.rs) — NOT a
+/// full structural decoder — chosen so no shape a correct in-place `md` can emit
+/// is ever rejected, while the request is bound tightly enough that a receipt
+/// for a different target/command/mode cannot pass. Checked: command kind, file,
+/// guard state, disposition/changed consistency, content===null (every adapter
+/// mutation is in-place), well-formed required/optional spans with non-negative
+/// integer bounds, and the COMMAND-SPECIFIC target identity (loc / section
+/// selector tuple + nested section span+etag / source+destination selectors +
+/// placement). Deliberately NOT exhaustively decoded (unreachable from a correct
+/// binary; see ADR 0003 revisit trigger): u32 UPPER bound, every nested
+/// SectionEntry field, and leveling/level_shift cross-consistency. Additive
+/// fields are tolerated; anything failing the above is indeterminate, never
+/// accepted as success. schema_version is checked upstream.
 function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationExpectation): boolean {
 	if (typeof data.file !== "string" || data.file.length === 0) return false;
 	if (expect.file !== undefined && data.file !== expect.file) return false;

@@ -101,6 +101,14 @@ Accepted boundaries (explicit non-goals, not overclaimed):
   residual (std has no immutable-handle exec).
 - The atomic writer's check→rename and check→unlink windows remain std-only
   residuals; the parent directory is not fsynced (old-or-new, never corrupt).
+- Receipt validation (`isValidMutationReceipt`) is a **load-bearing subset**,
+  not a full structural decoder: it binds command/file/guard/target-identity and
+  the fields a wrong receipt would trip on, chosen so no shape a correct in-place
+  `md` emits is rejected. Deliberately NOT validated (unreachable from a correct
+  binary — a contract-violating binary or custom runner is required): u32 UPPER
+  bound, exhaustive nested `SectionEntry` fields, and leveling/level_shift
+  cross-consistency. Independent review confirmed no real-binary false-negative
+  or false-positive; the residual is version-skew / non-`md` hardening only.
 
 ## Revisit Triggers
 
@@ -114,6 +122,10 @@ Accepted boundaries (explicit non-goals, not overclaimed):
 - Real cross-process or external-writer contention appears: revisit filesystem
   CAS / cooperative locking and immutable-handle (fd-based) execution, both
   explicitly deferred out of the 2026-07-18 closeout.
+- A real `md` receipt is ever rejected as indeterminate, or version-skew ships a
+  receipt shape the load-bearing subset does not cover: promote
+  `isValidMutationReceipt` to a full command-discriminated structural decoder
+  (u32 upper bound, exhaustive nested fields, leveling/level_shift consistency).
 
 ## References
 
