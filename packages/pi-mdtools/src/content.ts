@@ -54,20 +54,34 @@ export async function renderMdToolResult(envelope: MdResultEnvelope): Promise<Pi
 	};
 }
 
-export function formatStatus(status: { binary: { found: boolean; path?: string; source?: string; searched: string[] }; cwd: string }): string {
+export function formatStatus(status: {
+	binary: { found: boolean; path?: string; source?: string; searched: string[] };
+	cwd: string;
+	handshake?: { verdict: "current" | "legacy" | "missing"; binaryVersion?: string; capabilities?: string[]; schemaVersion?: string };
+}): string {
 	if (status.binary.found) {
-		return [
+		const lines = [
 			"mdtools for Pi",
 			`status: ready`,
 			`binary: ${status.binary.path ?? "unknown"}`,
 			`source: ${status.binary.source ?? "unknown"}`,
 			`cwd: ${status.cwd}`,
-		].join("\n");
+		];
+		const handshake = status.handshake;
+		if (handshake !== undefined) {
+			lines.push(`contract: ${handshake.verdict}${handshake.binaryVersion !== undefined ? ` (md ${handshake.binaryVersion})` : ""}`);
+			if (handshake.verdict === "legacy") {
+				lines.push(
+					"repair: this md binary predates the structured error contract; upgrade with `cargo install --path <mdtools-repo>` or reinstall from a release, then re-run /mdtools status",
+				);
+			}
+		}
+		return lines.join("\n");
 	}
 	return [
 		"mdtools for Pi",
 		"status: md binary not found",
-		"install: cargo install mdtools, ensure `md` is on PATH, or set MDTOOLS_MD_BIN=/path/to/md",
+		"install: cargo install mdtools, ensure `md` is on PATH, or set MD_BINARY_PATH=/path/to/md (MDTOOLS_MD_BIN also works)",
 		`searched: ${status.binary.searched.join(", ") || "none"}`,
 		`cwd: ${status.cwd}`,
 	].join("\n");
@@ -84,15 +98,15 @@ export function helpText(): string {
 		"- md_table(file, index?, select?, where?)",
 		"- md_blocks(file)",
 		"- md_block(file, index)",
-		"- md_set_task(file, loc, status)",
+		"- md_set_task(file, loc, status, expectEtag?)",
 		"- md_move_section(file, source, destination, placement)",
 		"- md_replace_section(file, heading, content, expectEtag?)",
 		"",
-		"Recovery contract:",
+		"Recovery contract (errors come from the md binary's structured envelope):",
 		"- failed/ambiguous results include error.code and error.nextAction",
 		"- ambiguous heading targets include candidates[]; retry with occurrence/sourceOccurrence/destinationOccurrence",
 		"- stale task locs include current task candidates[]; retry md_set_task with a fresh loc from md_tasks",
-		"- stale expectEtag values fail closed; re-run md_blocks and retry with the fresh etag",
+		"- stale expectEtag values fail closed (section etags from md_outline/md_section, task etags from md_tasks); identical-duplicate targets fail closed as ambiguous",
 		"",
 		"Commands:",
 		"/mdtools status",

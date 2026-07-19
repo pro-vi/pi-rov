@@ -3,78 +3,59 @@ export interface MdToolPrompt {
 	promptGuidelines: string[];
 }
 
+// Budget note: pi dedupes promptGuidelines by exact string across tools, so
+// shared bullets cost once. The deduped snippet+guideline surface is capped
+// at ~400 tokens by test/usage.test.ts — trim here, never raise the cap
+// without deciding to spend context.
+
 const STRUCTURAL_READ_GUIDELINES = [
-	"Use md_outline, md_section, md_tasks, md_table, md_blocks, or md_block for structural Markdown reads instead of grep when headings, tasks, tables, block spans, or etags matter.",
-	"Use md_* tool candidates and error.nextAction to recover from ambiguous or stale Markdown targets before retrying a mutation.",
+	"Prefer md_outline/md_section/md_tasks/md_table/md_blocks/md_block over grep for Markdown structure (headings, tasks, tables, spans, etags).",
+	"On ambiguous or stale Markdown targets, follow error.nextAction and candidates[] before retrying.",
 ] as const;
 
 const STRUCTURAL_MUTATION_GUIDELINES = [
-	"Use md_set_task, md_move_section, and md_replace_section for structural Markdown mutations; keep Pi edit for generic text edits.",
-	"Use md_blocks before md_replace_section when drift safety matters, then pass the selected heading block etag as expectEtag.",
+	"Use md_set_task, md_move_section, and md_replace_section for structural Markdown edits; keep Pi edit for plain text.",
+	"Pass expectEtag for drift-safe Markdown edits (section etags: md_outline/md_section; task etags: md_tasks); stale or duplicate-ambiguous etags fail closed — re-read and retry.",
 ] as const;
 
 export const MD_TOOL_PROMPTS = {
 	md_outline: {
-		promptSnippet: "Read Markdown heading outlines with mdtools/comrak JSON spans.",
-		promptGuidelines: [
-			"Use md_outline when you need the current Markdown heading tree, heading spans, or duplicate-heading context.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptSnippet: "Read Markdown heading outlines with spans and section etags.",
+		promptGuidelines: [...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_section: {
-		promptSnippet: "Read one Markdown section by heading with ambiguity candidates.",
-		promptGuidelines: [
-			"Use md_section when you need a section's body by heading; if it returns ambiguous candidates, retry with occurrence.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptSnippet: "Read one Markdown section by heading text.",
+		promptGuidelines: [...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_tasks: {
-		promptSnippet: "List GFM task checkboxes with structural locs and headings.",
-		promptGuidelines: [
-			"Use md_tasks before md_set_task so you mutate by the current structural task loc, not by line number.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptSnippet: "List GFM task checkboxes with structural locs and etags.",
+		promptGuidelines: ["Run md_tasks before md_set_task: mutate by current loc, never by line number.", ...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_table: {
 		promptSnippet: "Read or project Markdown tables structurally.",
-		promptGuidelines: [
-			"Use md_table when Markdown table rows or columns matter; prefer select/where over ad hoc text filtering.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptGuidelines: [...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_blocks: {
 		promptSnippet: "List Markdown blocks with spans, previews, and etags.",
-		promptGuidelines: [
-			"Use md_blocks when you need Markdown block indices, previews, spans, or etags for drift-safe edits.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptGuidelines: [...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_block: {
 		promptSnippet: "Read one Markdown block by index.",
-		promptGuidelines: [
-			"Use md_block when you already have a block index and need that block's exact content or metadata.",
-			...STRUCTURAL_READ_GUIDELINES,
-		],
+		promptGuidelines: [...STRUCTURAL_READ_GUIDELINES],
 	},
 	md_set_task: {
 		promptSnippet: "Set a Markdown task checkbox by structural loc.",
-		promptGuidelines: [
-			"Use md_set_task only with a loc from current md_tasks output; on E_BAD_LOC, choose from candidates or re-run md_tasks.",
-			...STRUCTURAL_MUTATION_GUIDELINES,
-		],
+		promptGuidelines: ["On E_BAD_LOC, pick a fresh loc from candidates[] or re-run md_tasks.", ...STRUCTURAL_MUTATION_GUIDELINES],
 	},
 	md_move_section: {
-		promptSnippet: "Move Markdown sections structurally with auto-releveling and ambiguity checks.",
+		promptSnippet: "Move Markdown sections with auto-releveling.",
 		promptGuidelines: [
-			"Use md_move_section for section relocation; if headings are duplicated, retry with sourceOccurrence and destinationOccurrence from candidates.",
+			"On duplicate headings, retry md_move_section with sourceOccurrence/destinationOccurrence from candidates[].",
 			...STRUCTURAL_MUTATION_GUIDELINES,
 		],
 	},
 	md_replace_section: {
-		promptSnippet: "Replace Markdown sections by heading with optional etag drift guard.",
-		promptGuidelines: [
-			"Use md_replace_section for whole-section replacement; pass expectEtag from md_blocks when stale-target safety matters.",
-			...STRUCTURAL_MUTATION_GUIDELINES,
-		],
+		promptSnippet: "Replace a Markdown section by heading, with etag drift guard.",
+		promptGuidelines: [...STRUCTURAL_MUTATION_GUIDELINES],
 	},
 } satisfies Record<string, MdToolPrompt>;

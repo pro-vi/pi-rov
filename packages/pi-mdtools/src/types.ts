@@ -1,5 +1,17 @@
 export type MdToolStatus = "ok" | "ambiguous" | "failed";
 export type TaskStatus = "pending" | "done";
+
+/// Lifecycle authority for a MUTATION call, owned by the Pi runtime (not the
+/// binary). Queries never carry one. The invariants (see the plan's
+/// State-Action Contracts):
+///   - status === "ok"            iff  mutationOutcome === "completed"
+///   - "indeterminate" is EPISTEMIC: the child spawned — OR spawning cannot be
+///     disproven (e.g. a runner rejection with unknown spawn state) — and no
+///     authoritative v1 receipt/error envelope was accepted. Re-read required.
+///   - "not_started" is used ONLY when the mutation is PROVEN never to have
+///     spawned (pre-spawn abort, unresolved/non-current binary, a runner
+///     execution flagged started:false) — the file is untouched.
+export type MutationOutcome = "not_started" | "rejected" | "completed" | "indeterminate";
 export type MovePlacement = "after" | "before" | "into";
 export type SectionLeveling = "auto" | "keep";
 
@@ -14,7 +26,19 @@ export type MdErrorCode =
 	| "E_HEADING_NOT_FOUND"
 	| "E_AMBIGUOUS_HEADING"
 	| "E_OCCURRENCE_OUT_OF_RANGE"
+	| "E_ETAG_AMBIGUOUS"
+	| "E_MD_VERSION_UNSUPPORTED"
 	| "E_BAD_LOC";
+
+/// Handshake verdict from probing `md schema --json` once per runtime.
+/// "current" requires schema_version mdtools.v1 AND the required capability
+/// set; a version match with a missing capability is "legacy".
+export interface MdHandshake {
+	verdict: "current" | "legacy" | "missing";
+	binaryVersion?: string;
+	capabilities?: string[];
+	schemaVersion?: string;
+}
 
 export interface MdCommandRequest {
 	binary: string;
@@ -32,6 +56,11 @@ export interface MdCommandExecution {
 	stdout: string;
 	stderr: string;
 	killed: boolean;
+	/// True once the child process actually spawned (the `spawn` event fired).
+	/// Distinguishes a pre-spawn failure (never started ⇒ untouched) from a
+	/// post-start result loss (started ⇒ indeterminate). A synchronous spawn
+	/// throw or an ENOENT-class error before spawn leaves this false.
+	started: boolean;
 }
 
 export type MdCommandRunner = (request: MdCommandRequest) => Promise<MdCommandExecution>;
@@ -46,6 +75,18 @@ export interface MdBinaryResolution {
 export interface MdtoolsStatus {
 	binary: MdBinaryResolution;
 	cwd: string;
+	handshake?: MdHandshake;
+}
+
+/// One observed binary context, stable across the schema probe: the resolution
+/// actually probed, its handshake verdict, and the content-identity key that
+/// held from before the probe through the pre-spawn checkpoint. Execution,
+/// failure classification, and recovery enrichment all reuse THIS — they never
+/// independently re-resolve or re-handshake a possibly-different binary.
+export interface ObservedContext {
+	resolution: MdBinaryResolution;
+	handshake: MdHandshake;
+	identityKey: string;
 }
 
 export interface MdErrorInfo {
@@ -55,6 +96,14 @@ export interface MdErrorInfo {
 	exitCode?: number | null;
 	stderr?: string;
 	hint?: string;
+	/// Structured context projected from the binary's envelope.
+	expectedEtag?: string;
+	foundEtag?: string;
+	loc?: string;
+	role?: "target" | "source" | "destination";
+	requestedOccurrence?: number;
+	/// Full match count from the binary; candidates[] may be a capped prefix.
+	totalMatches?: number;
 }
 
 export interface MdCandidate {
@@ -63,6 +112,7 @@ export interface MdCandidate {
 	occurrence?: number;
 	level?: number;
 	blockIndex?: number;
+	line?: number;
 	etag?: string;
 	loc?: string;
 	status?: TaskStatus;
@@ -83,6 +133,8 @@ interface MdResultBase {
 	command: string;
 	file?: string;
 	meta: MdResultMeta;
+	/// Present only for mutation calls. See MutationOutcome for the invariants.
+	mutationOutcome?: MutationOutcome;
 }
 
 export type MdResultEnvelope<TData = unknown> =
@@ -141,6 +193,7 @@ export interface SetTaskParams {
 	file: string;
 	loc: string;
 	status: TaskStatus;
+	expectEtag?: string;
 }
 
 export interface MoveSectionParams {

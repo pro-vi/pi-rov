@@ -24,7 +24,8 @@
 		"typecheck": "tsc --noEmit -p tsconfig.json",
 		"test": "node --import=tsx --test test/*.test.ts",
 		"smoke-test": "PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 pi --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files -e ./index.ts -p '/mdtools status'",
-		"check": "npm run typecheck && npm run test && npm run smoke-test"
+		"check": "npm run typecheck && npm run test && npm run smoke-test",
+		"test:parity": "node --import=tsx --test test/integration.parity.test.ts"
 	},
 	"pi": {
 		"extensions": [
