@@ -130,11 +130,13 @@ function decodeBinaryErrorEnvelope(stdout: string, exitCode: number | null, expe
 		return undefined;
 	}
 	if (!isRecord(parsed) || !isRecord(parsed.error)) return undefined;
-	// If the envelope names a top-level file, it must be the file we asked
-	// about. A contradictory file means this is not an authoritative response
-	// for our request — do not trust it as a clean rejection.
-	if (expectedFile !== undefined && typeof parsed.file === "string" && parsed.file !== expectedFile) {
-		return undefined;
+	// The envelope's top-level `file` is absent under the current Rust contract
+	// (Option::None skips serialization). If it IS present it must be the exact
+	// file we asked about — a non-string or contradictory value means this is
+	// not an authoritative response for our request, so don't trust it as a
+	// clean rejection. (Absent remains valid.)
+	if (expectedFile !== undefined && "file" in parsed) {
+		if (typeof parsed.file !== "string" || parsed.file !== expectedFile) return undefined;
 	}
 	const err = parsed.error;
 	const diagnosticCode = stringValue(err.code);
@@ -664,61 +666,105 @@ const LINE_ENDING_STYLES = new Set(["Lf", "Crlf", "Mixed"]);
 /// The MutationTargetRef discriminant each adapter mutation must carry
 /// (Rust src/model.rs MutationTargetRef). A receipt whose target is not the
 /// discriminant this command produces is not our receipt.
-const EXPECTED_TARGET_DISCRIMINANT: Record<string, string> = {
+const EXPECTED_TARGET_DISCRIMINANT: Record<"SetTask" | "MoveSection" | "ReplaceSection", string> = {
 	SetTask: "TaskItem",
 	MoveSection: "SectionMove",
 	ReplaceSection: "Section",
 };
 
 /// What the adapter asked for, so a receipt can be bound to THIS request — not
-/// merely proven to be some valid receipt.
+/// merely proven to be some valid receipt. Command-discriminated identity.
 interface MutationExpectation {
-	command: string;
+	command: "SetTask" | "MoveSection" | "ReplaceSection";
 	file: string | undefined;
 	/// True iff we passed an etag guard: the receipt's `guarded` must match.
 	guarded: boolean;
-	/// SetTask: the exact loc we targeted (target identity binding).
+	/// SetTask: the exact loc we targeted.
 	loc?: string;
+	/// ReplaceSection: the heading selector we targeted.
+	heading?: string;
+	/// MoveSection: the source/destination heading selectors we targeted.
+	source?: string;
+	destination?: string;
+}
+
+/// A span field is either null (Rust Option::None) or an object with the four
+/// numeric bounds — reject any other shape (e.g. a numeric span).
+function isValidSpanOrNull(value: unknown): boolean {
+	if (value === null || value === undefined) return true;
+	if (!isRecord(value)) return false;
+	for (const key of ["line_start", "line_end", "byte_start", "byte_end"]) {
+		if (typeof value[key] !== "number") return false;
+	}
+	return true;
+}
+
+/// The heading a SectionTargetRef.selector names (Rust SectionSelector), or
+/// undefined if the shape is wrong.
+function selectorHeading(target: unknown, discriminant: string): string | undefined {
+	if (!isRecord(target)) return undefined;
+	const ref = target[discriminant];
+	if (!isRecord(ref) || !isRecord(ref.selector)) return undefined;
+	const heading = ref.selector.heading_text;
+	return typeof heading === "string" ? heading : undefined;
 }
 
 /// A schema-valid object is NOT automatically a mutation receipt, and a valid
 /// receipt for SOME mutation is not authoritative for THIS one. Validate the
-/// complete required MutationResult wire shape (Rust src/model.rs) — tolerating
-/// ADDITIVE fields only — AND bind it to the request: command kind, file, guard
-/// state, the target discriminant, and (where the adapter knows it) the target
-/// identity. Anything else is indeterminate, never accepted as success.
-/// schema_version is already checked upstream.
+/// required MutationResult wire shape (Rust src/model.rs) — tolerating ADDITIVE
+/// fields only — AND bind it to the request: command kind, file, guard state,
+/// disposition/changed consistency, well-formed content/spans, and the
+/// COMMAND-SPECIFIC target identity (loc / heading / source+destination).
+/// Anything else is indeterminate, never accepted as success. schema_version is
+/// checked upstream.
 function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationExpectation): boolean {
 	if (typeof data.file !== "string" || data.file.length === 0) return false;
 	if (expect.file !== undefined && data.file !== expect.file) return false;
 	if (typeof data.command !== "string" || data.command !== expect.command || !MUTATION_COMMAND_KINDS.has(data.command)) return false;
 	if (typeof data.disposition !== "string" || !MUTATION_DISPOSITIONS.has(data.disposition)) return false;
 	if (typeof data.changed !== "boolean") return false;
+	// disposition/changed must agree: changed iff not a NoChange.
+	if (data.changed !== (data.disposition !== "NoChange")) return false;
 	// Guard state must match what we asked for: a guarded call whose receipt
 	// says guarded:false means the guard silently did not apply.
 	if (typeof data.guarded !== "boolean" || data.guarded !== expect.guarded) return false;
 	if (typeof data.line_endings !== "string" || !LINE_ENDING_STYLES.has(data.line_endings)) return false;
-	// content is a required MutationResult field (string, or null when omitted).
-	if (!("content" in data)) return false;
-	// invariant must carry its full required shape, not just one field.
+	// content is a required MutationResult field: a string, or null when omitted
+	// — never a number/object.
+	if (!(data.content === null || typeof data.content === "string")) return false;
+	// invariant must carry its full required shape with well-formed spans.
 	if (
 		!isRecord(data.invariant) ||
 		typeof data.invariant.preserves_non_target_bytes !== "boolean" ||
-		!("target_span_before" in data.invariant) ||
-		!("target_span_after" in data.invariant)
+		!isValidSpanOrNull(data.invariant.target_span_before) ||
+		!isValidSpanOrNull(data.invariant.target_span_after)
 	) {
 		return false;
 	}
 	if (!isRecord(data.target)) return false;
 	const wantTarget = EXPECTED_TARGET_DISCRIMINANT[expect.command];
-	if (wantTarget !== undefined) {
-		const inner = data.target[wantTarget];
-		// The discriminant's inner object must be present and non-empty.
-		if (!isRecord(inner) || Object.keys(inner).length === 0) return false;
-		// Target IDENTITY binding where the adapter knows it: SetTask's loc.
-		if (expect.loc !== undefined && inner.loc !== expect.loc) return false;
+	const inner = data.target[wantTarget];
+	if (!isRecord(inner) || Object.keys(inner).length === 0) return false;
+
+	// COMMAND-SPECIFIC target identity binding.
+	switch (expect.command) {
+		case "SetTask":
+			if (typeof inner.loc !== "string" || (expect.loc !== undefined && inner.loc !== expect.loc)) return false;
+			if (typeof inner.block_index !== "number") return false;
+			if (!isValidSpanOrNull(inner.span)) return false;
+			return true;
+		case "ReplaceSection":
+			if (expect.heading !== undefined && selectorHeading(data.target, "Section") !== expect.heading) return false;
+			return true;
+		case "MoveSection": {
+			const move = inner;
+			if (expect.source !== undefined && selectorHeading(move, "source") !== expect.source) return false;
+			if (expect.destination !== undefined && selectorHeading(move, "destination") !== expect.destination) return false;
+			return true;
+		}
+		default:
+			return false;
 	}
-	return true;
 }
 
 function taskCandidatesFromData(data: Record<string, unknown>): MdCandidate[] | undefined {
@@ -846,12 +892,19 @@ export class MdtoolsRuntime {
 		if (!resolution.found || resolution.path === undefined) {
 			return { handshake: { verdict: "missing" }, cacheable: true };
 		}
-		const execution = await this.runner({
-			binary: resolution.path,
-			args: ["schema", "--json"],
-			cwd: this.cwd,
-			timeoutMs: this.timeoutMs,
-		});
+		let execution: MdCommandExecution;
+		try {
+			execution = await this.runner({
+				binary: resolution.path,
+				args: ["schema", "--json"],
+				cwd: this.cwd,
+				timeoutMs: this.timeoutMs,
+			});
+		} catch {
+			// A rejecting runner is a transient, non-authoritative probe result:
+			// legacy, never cached.
+			return { handshake: { verdict: "legacy" }, cacheable: false };
+		}
 		if (execution.killed || execution.code === null) {
 			// Transient: the probe never produced an authoritative answer.
 			return { handshake: { verdict: "legacy" }, cacheable: false };
@@ -940,7 +993,13 @@ export class MdtoolsRuntime {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
 		// moveSection exposes no etag param, so the receipt must be unguarded.
-		return await this.runJson("md_move_section", args, file, signal, { command: "MoveSection", file, guarded: false });
+		return await this.runJson("md_move_section", args, file, signal, {
+			command: "MoveSection",
+			file,
+			guarded: false,
+			source: params.source,
+			destination: params.destination,
+		});
 	}
 
 	async replaceSection(params: ReplaceSectionParams, signal?: AbortSignal): Promise<MdResultEnvelope> {
@@ -1004,6 +1063,7 @@ export class MdtoolsRuntime {
 				command: "ReplaceSection",
 				file,
 				guarded: params.expectEtag !== undefined,
+				heading: params.heading,
 			});
 		} finally {
 			// Cleanup must NEVER throw over the authoritative result (force + swallow).
@@ -1063,13 +1123,20 @@ export class MdtoolsRuntime {
 		// rather than run a DIFFERENT binary and inject its candidates.
 		const identityNow = await this.binaryIdentityKey(resolution);
 		if (identityNow !== observed.identityKey || identityNow.endsWith("<unstattable>")) return undefined;
-		const execution = await this.runner({
-			binary: resolution.path,
-			args,
-			cwd: this.cwd,
-			timeoutMs: this.timeoutMs,
-			...(signal !== undefined ? { signal } : {}),
-		});
+		let execution: MdCommandExecution;
+		try {
+			execution = await this.runner({
+				binary: resolution.path,
+				args,
+				cwd: this.cwd,
+				timeoutMs: this.timeoutMs,
+				...(signal !== undefined ? { signal } : {}),
+			});
+		} catch {
+			// Best-effort enrichment: a rejecting runner never masks the
+			// original error — just skip enrichment.
+			return undefined;
+		}
 		if (execution.killed || execution.code !== 0) return undefined;
 		const parsed = parseJsonObject(execution.stdout);
 		return parsed.ok ? parsed.data : undefined;
@@ -1181,13 +1248,63 @@ export class MdtoolsRuntime {
 			};
 		}
 
-		const execution = await this.runner({
-			binary: resolution.path,
-			args,
-			cwd: this.cwd,
-			timeoutMs: this.timeoutMs,
-			...(signal !== undefined ? { signal } : {}),
-		});
+		// Capability gate: a MUTATION must not spawn against a non-current
+		// binary (missing a required capability like atomic_write) — the
+		// partial-deployment guarantee requires failing closed BEFORE the write,
+		// as not_started (untouched) with upgrade guidance. Read-only commands
+		// continue via graceful degradation.
+		if (mutating && observed.handshake.verdict !== "current") {
+			return {
+				ok: false,
+				result: unresolvedResultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					args,
+					cwd: this.cwd,
+					code: "E_MD_VERSION_UNSUPPORTED",
+					message: "the installed md binary is not current (missing a required capability); the mutation was not run.",
+					nextAction: "Upgrade mdtools (cargo install --path <mdtools-repo> or reinstall from a release), then retry. Nothing was changed.",
+					mutationOutcome: "not_started",
+				}),
+			};
+		}
+
+		let execution: MdCommandExecution;
+		try {
+			execution = await this.runner({
+				binary: resolution.path,
+				args,
+				cwd: this.cwd,
+				timeoutMs: this.timeoutMs,
+				...(signal !== undefined ? { signal } : {}),
+			});
+		} catch (error) {
+			// A runner (embedder/test) that REJECTS gives no proof of spawn
+			// state: conservatively indeterminate for a mutation (may have run),
+			// a plain failure for a read. Never an escaping raw rejection.
+			return {
+				ok: false,
+				result: resultWithError({
+					status: "failed",
+					command,
+					...(file !== undefined ? { file } : {}),
+					meta: commandMeta(command, file, {
+						binary: resolution.path,
+						args,
+						cwd: this.cwd,
+						code: null,
+						stdout: "",
+						stderr: "",
+						killed: false,
+						started: false,
+					}),
+					code: mutating ? "E_MD_COMMAND_ABORTED" : "E_MD_COMMAND_FAILED",
+					message: `md runner failed: ${error instanceof Error ? error.message : String(error)}`,
+					...(mutating ? { mutationOutcome: "indeterminate" as MutationOutcome } : {}),
+				}),
+			};
+		}
 		if (execution.killed || execution.code !== 0 || execution.code === null) {
 			return { ok: false, result: await this.failureResult(command, file, execution, signal, mutating, observed) };
 		}

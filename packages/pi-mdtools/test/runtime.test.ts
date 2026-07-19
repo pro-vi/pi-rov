@@ -75,6 +75,8 @@ function envelope(code: string, extra: Record<string, unknown> = {}, context: Re
 	});
 }
 
+const SPAN = { line_start: 1, line_end: 1, byte_start: 0, byte_end: 5 };
+
 /// A well-formed MutationResult receipt (mirrors Rust src/model.rs: PascalCase
 /// command/disposition, required target + invariant). The runtime accepts a
 /// mutation as "completed" only against a shape like this.
@@ -83,7 +85,7 @@ function receipt(overrides: Record<string, unknown> = {}): string {
 		schema_version: "mdtools.v1",
 		file: "/work/doc.md",
 		command: "SetTask",
-		target: { TaskItem: { kind: "TaskItem", loc: "0.0", block_index: 1, child_path: [0], span: {} } },
+		target: { TaskItem: { kind: "TaskItem", loc: "0.0", block_index: 1, child_path: [0], span: SPAN } },
 		disposition: "Replaced",
 		changed: true,
 		guarded: false,
@@ -327,7 +329,7 @@ test("mutation outcome: a valid v1 receipt is completed", async () => {
 	// receipt loc must match the requested loc (target identity binding)
 	const r = receipt({
 		command: "SetTask",
-		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } },
 	});
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, r)));
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
@@ -409,7 +411,7 @@ test("receipt is request-bound: a receipt for a DIFFERENT file is indeterminate"
 test("receipt is request-bound: a receipt for a DIFFERENT loc is indeterminate", async () => {
 	const wrongLoc = receipt({
 		command: "SetTask",
-		target: { TaskItem: { kind: "TaskItem", loc: "9.0", block_index: 9, child_path: [0], span: {} } },
+		target: { TaskItem: { kind: "TaskItem", loc: "9.0", block_index: 9, child_path: [0], span: SPAN } },
 	});
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrongLoc)));
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
@@ -421,7 +423,7 @@ test("receipt is request-bound: a guarded call whose receipt says guarded:false 
 	const unguardedReceipt = receipt({
 		command: "SetTask",
 		guarded: false,
-		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } },
 	});
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, unguardedReceipt)));
 	// We asked for a guard (expectEtag); a receipt claiming guarded:false means
@@ -429,6 +431,50 @@ test("receipt is request-bound: a guarded call whose receipt says guarded:false 
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "abcd" });
 	assert.equal(result.status, "failed");
 	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt is request-bound: ReplaceSection receipt for a different heading is indeterminate", async () => {
+	const wrong = receipt({
+		command: "ReplaceSection",
+		disposition: "Replaced",
+		changed: true,
+		target: { Section: { kind: "Section", selector: { heading_text: "Other", occurrence: null, match_mode: "Exact" }, section: { etag: "e" } } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.replaceSection({ file: "doc.md", heading: "Alpha", content: "x" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt is request-bound: MoveSection receipt for different selectors is indeterminate", async () => {
+	const wrong = receipt({
+		command: "MoveSection",
+		disposition: "Replaced",
+		changed: true,
+		target: {
+			SectionMove: {
+				kind: "SectionMove",
+				source: { selector: { heading_text: "WrongSource" } },
+				destination: { selector: { heading_text: "WrongDest" } },
+			},
+		},
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.moveSection({ file: "doc.md", source: "A", destination: "B", placement: "into" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("a rejecting runner is classified indeterminate for mutations, never escapes", async () => {
+	const runner = async (request: MdCommandRequest): Promise<MdCommandExecution> => {
+		if (request.args[0] === "schema") return execution(request, SCHEMA_OK);
+		throw new Error("injected runner rejection");
+	};
+	const runtime = new MdtoolsRuntime({ cwd: "/work", binary: process.execPath, runner });
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.match(result.error?.message ?? "", /runner failed/i);
 });
 
 test("error envelope naming a different file is not authoritative", async () => {
@@ -444,19 +490,19 @@ test("error envelope naming a different file is not authoritative", async () => 
 	assert.equal(result.mutationOutcome, "indeterminate");
 });
 
-test("indeterminate advice leads with re-read, then upgrade (legacy exit-4 mutation)", async () => {
-	const { runtime } = fakeRuntime((request) =>
-		request.args[0] === "schema"
-			? execution(request, SCHEMA_LEGACY_CAPS)
-			: execution(request, "", { code: 4, stderr: "conflict" }),
-	);
+test("capability gate: a mutation on a non-current binary is not_started, never spawned", async () => {
+	// A legacy binary (missing a required capability) must fail BEFORE the write.
+	const calls: string[] = [];
+	const { runtime } = fakeRuntime((request) => {
+		calls.push(request.args[0] as string);
+		return request.args[0] === "schema" ? execution(request, SCHEMA_LEGACY_CAPS) : execution(request, receipt());
+	});
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done", expectEtag: "aaaa" });
-	assert.equal(result.mutationOutcome, "indeterminate");
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
 	assert.equal(result.error?.code, "E_MD_VERSION_UNSUPPORTED");
-	const advice = result.error?.nextAction ?? "";
-	assert.match(advice, /re-read/i);
-	// re-read must come BEFORE any upgrade/retry directive
-	assert.ok(advice.toLowerCase().indexOf("re-read") < advice.toLowerCase().indexOf("upgrade"), advice);
+	assert.match(result.error?.nextAction ?? "", /upgrade/i);
+	assert.ok(!calls.includes("set-task"), "a non-current binary must never spawn the mutation");
 });
 
 test("indeterminate advice leads with re-read (schema-mismatch mutation)", async () => {
@@ -482,7 +528,7 @@ test("receipt with an invalid line_endings value is indeterminate", async () => 
 		command: "SetTask",
 		guarded: false,
 		line_endings: "CR", // not one of Lf/Crlf/Mixed
-		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: {} } },
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } },
 	});
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, badLineEndings)));
 	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });

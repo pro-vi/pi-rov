@@ -233,6 +233,15 @@ test("parity: a real mutation returns a validated receipt as completed", { skip:
 	assert.equal((result.data as { changed?: boolean })?.changed, true);
 });
 
+test("parity: a real move-section receipt validates as completed (deep identity binding)", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "doc.md");
+	await writeFile(doc, "# R\n\n## Src\n\nbody\n\n## Dst\n\nother\n", "utf8");
+	const result = await runtime.moveSection({ file: doc, source: "Src", destination: "Dst", placement: "into" });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+	assert.equal(result.mutationOutcome, "completed");
+});
+
 test("parity: expectEtag with a hyphen-leading value reaches md as data, never clap", { skip: !enabled }, async () => {
 	const { runtime, dir } = await realRuntime();
 	const doc = join(dir, "tasks.md");
