@@ -433,6 +433,89 @@ test("receipt is request-bound: a guarded call whose receipt says guarded:false 
 	assert.equal(result.mutationOutcome, "indeterminate");
 });
 
+test("receipt is request-bound: ReplaceSection receipt for a different occurrence is indeterminate", async () => {
+	// We asked for occurrence 2; a receipt for occurrence 1 is a different target.
+	const wrong = receipt({
+		command: "ReplaceSection",
+		disposition: "Replaced",
+		changed: true,
+		target: {
+			Section: {
+				kind: "Section",
+				selector: { kind: "HeadingText", heading_text: "Dup", occurrence: 1, match_mode: "Exact" },
+				section: { etag: "e" },
+			},
+		},
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.replaceSection({ file: "doc.md", heading: "Dup", occurrence: 2, content: "x" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt is request-bound: MoveSection receipt with a different placement is indeterminate", async () => {
+	const wrong = receipt({
+		command: "MoveSection",
+		disposition: "Replaced",
+		changed: true,
+		target: {
+			SectionMove: {
+				kind: "SectionMove",
+				source: { selector: { kind: "HeadingText", heading_text: "A", occurrence: null, match_mode: "Exact" } },
+				destination: { selector: { kind: "HeadingText", heading_text: "B", occurrence: null, match_mode: "Exact" } },
+				destination_mode: "after_sibling", // we asked for "into"
+			},
+		},
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
+	const result = await runtime.moveSection({ file: "doc.md", source: "A", destination: "B", placement: "into" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt with a non-null content (dry-run/stdout) is indeterminate — adapter mutations are in-place", async () => {
+	const dryRun = receipt({
+		command: "SetTask",
+		content: "the whole rewritten document",
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, dryRun)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt with a fractional u32 (block_index) is indeterminate", async () => {
+	const bad = receipt({
+		command: "SetTask",
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1.5, child_path: [0], span: SPAN } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, bad)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("receipt with a null required task span is indeterminate", async () => {
+	const bad = receipt({
+		command: "SetTask",
+		target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: null } },
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, bad)));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
+test("lifecycle: started:false with exit 0 is not accepted as completed", async () => {
+	// A runner that reports a (cached/forged) valid receipt WITHOUT spawning.
+	const r = receipt({ command: "SetTask", target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } } });
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, r, { started: false })));
+	const result = await runtime.setTask({ file: "doc.md", loc: "1.0", status: "done" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "not_started");
+});
+
 test("receipt is request-bound: ReplaceSection receipt for a different heading is indeterminate", async () => {
 	const wrong = receipt({
 		command: "ReplaceSection",

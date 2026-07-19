@@ -233,6 +233,37 @@ test("parity: a real mutation returns a validated receipt as completed", { skip:
 	assert.equal((result.data as { changed?: boolean })?.changed, true);
 });
 
+test("parity: a real :preamble replace validates as completed (selector kind binding)", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "doc.md");
+	await writeFile(doc, "intro preamble\n\n# Heading\n\nbody\n", "utf8");
+	// Rust emits selector { kind: "Preamble", heading_text: null } — the binding
+	// must accept this, not reject a genuine success as indeterminate.
+	const result = await runtime.replaceSection({ file: doc, heading: ":preamble", content: "rewritten preamble\n" });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+	assert.equal(result.mutationOutcome, "completed");
+});
+
+test("parity: a real occurrence-2 replace validates as completed (occurrence binding)", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "doc.md");
+	await writeFile(doc, "# R\n\n## Dup\n\nfirst\n\n## Dup\n\nsecond\n", "utf8");
+	const result = await runtime.replaceSection({ file: doc, heading: "Dup", occurrence: 2, content: "## Dup\n\nnew second\n" });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+	assert.equal(result.mutationOutcome, "completed");
+});
+
+test("parity: a real ignore-case replace validates as completed (match_mode binding)", { skip: !enabled }, async () => {
+	const { runtime, dir } = await realRuntime();
+	const doc = join(dir, "doc.md");
+	await writeFile(doc, "# Methods\n\nbody\n", "utf8");
+	// query case differs from the doc; match_mode is ExactIgnoreCase — the
+	// binding must accept it, not reject a real success as indeterminate.
+	const result = await runtime.replaceSection({ file: doc, heading: "methods", ignoreCase: true, content: "# Methods\n\nnew\n" });
+	assert.equal(result.status, "ok", JSON.stringify(result.error ?? {}));
+	assert.equal(result.mutationOutcome, "completed");
+});
+
 test("parity: a real move-section receipt validates as completed (deep identity binding)", { skip: !enabled }, async () => {
 	const { runtime, dir } = await realRuntime();
 	const doc = join(dir, "doc.md");

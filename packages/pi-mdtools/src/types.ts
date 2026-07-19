@@ -5,10 +5,12 @@ export type TaskStatus = "pending" | "done";
 /// binary). Queries never carry one. The invariants (see the plan's
 /// State-Action Contracts):
 ///   - status === "ok"            iff  mutationOutcome === "completed"
-///   - mutationOutcome === "indeterminate"  iff the process started and no
-///     authoritative v1 receipt/error envelope was accepted (re-read required)
-///   - "not_started" is only used when the mutation is proven never to have
-///     spawned (pre-spawn abort, unresolved binary) — the file is untouched.
+///   - "indeterminate" is EPISTEMIC: the child spawned — OR spawning cannot be
+///     disproven (e.g. a runner rejection with unknown spawn state) — and no
+///     authoritative v1 receipt/error envelope was accepted. Re-read required.
+///   - "not_started" is used ONLY when the mutation is PROVEN never to have
+///     spawned (pre-spawn abort, unresolved/non-current binary, a runner
+///     execution flagged started:false) — the file is untouched.
 export type MutationOutcome = "not_started" | "rejected" | "completed" | "indeterminate";
 export type MovePlacement = "after" | "before" | "into";
 export type SectionLeveling = "auto" | "keep";

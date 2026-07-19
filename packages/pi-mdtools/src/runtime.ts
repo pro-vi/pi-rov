@@ -672,6 +672,19 @@ const EXPECTED_TARGET_DISCRIMINANT: Record<"SetTask" | "MoveSection" | "ReplaceS
 	ReplaceSection: "Section",
 };
 
+/// The full section selector the adapter requested (Rust SectionSelector), so
+/// a receipt's selector can be compared as a complete tuple — not just its
+/// heading text. `:preamble` is a distinct kind with a NULL heading_text.
+type SelectorExpectation =
+	| { kind: "preamble" }
+	| { kind: "heading"; heading: string; occurrence: number | null; matchMode: "Exact" | "ExactIgnoreCase" };
+
+/// Build the selector we expect a receipt to echo, from the adapter's args.
+function sectionSelectorExpectation(heading: string, occurrence: number | undefined, ignoreCase: boolean | undefined): SelectorExpectation {
+	if (heading === ":preamble") return { kind: "preamble" };
+	return { kind: "heading", heading, occurrence: occurrence ?? null, matchMode: ignoreCase === true ? "ExactIgnoreCase" : "Exact" };
+}
+
 /// What the adapter asked for, so a receipt can be bound to THIS request — not
 /// merely proven to be some valid receipt. Command-discriminated identity.
 interface MutationExpectation {
@@ -681,42 +694,61 @@ interface MutationExpectation {
 	guarded: boolean;
 	/// SetTask: the exact loc we targeted.
 	loc?: string;
-	/// ReplaceSection: the heading selector we targeted.
-	heading?: string;
-	/// MoveSection: the source/destination heading selectors we targeted.
-	source?: string;
-	destination?: string;
+	/// ReplaceSection: the full section selector we targeted.
+	section?: SelectorExpectation;
+	/// MoveSection: source/destination selectors and the placement mode.
+	source?: SelectorExpectation;
+	destination?: SelectorExpectation;
+	destinationMode?: "into_as_child" | "after_sibling" | "before_sibling";
 }
 
-/// A span field is either null (Rust Option::None) or an object with the four
-/// numeric bounds — reject any other shape (e.g. a numeric span).
-function isValidSpanOrNull(value: unknown): boolean {
-	if (value === null || value === undefined) return true;
-	if (!isRecord(value)) return false;
-	for (const key of ["line_start", "line_end", "byte_start", "byte_end"]) {
-		if (typeof value[key] !== "number") return false;
-	}
-	return true;
+/// A Rust u32 field: a non-negative integer (rejects fractional/negative).
+function isU32(value: unknown): boolean {
+	return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
-/// The heading a SectionTargetRef.selector names (Rust SectionSelector), or
-/// undefined if the shape is wrong.
-function selectorHeading(target: unknown, discriminant: string): string | undefined {
+/// A required SourceSpan: an object with four u32 bounds. Rejects null,
+/// undefined, and fractional/negative values.
+function isValidRequiredSpan(value: unknown): boolean {
+	return isRecord(value) && isU32(value.line_start) && isU32(value.line_end) && isU32(value.byte_start) && isU32(value.byte_end);
+}
+
+/// A Rust Option<SourceSpan> field: the KEY must be present (Option serializes
+/// as null or an object, never absent) and its value null or a valid span.
+function isValidOptionalSpanField(container: Record<string, unknown>, key: string): boolean {
+	if (!(key in container)) return false;
+	const value = container[key];
+	return value === null || isValidRequiredSpan(value);
+}
+
+/// Compare a receipt SectionSelector against the full requested tuple.
+function selectorMatches(selector: unknown, expect: SelectorExpectation): boolean {
+	if (!isRecord(selector)) return false;
+	if (expect.kind === "preamble") return selector.kind === "Preamble";
+	return (
+		selector.kind === "HeadingText" &&
+		selector.heading_text === expect.heading &&
+		(selector.occurrence ?? null) === expect.occurrence &&
+		selector.match_mode === expect.matchMode
+	);
+}
+
+/// The SectionSelector inside a SectionTargetRef at `target[discriminant]`.
+function refSelector(target: unknown, discriminant: string): unknown {
 	if (!isRecord(target)) return undefined;
 	const ref = target[discriminant];
-	if (!isRecord(ref) || !isRecord(ref.selector)) return undefined;
-	const heading = ref.selector.heading_text;
-	return typeof heading === "string" ? heading : undefined;
+	return isRecord(ref) ? ref.selector : undefined;
 }
 
 /// A schema-valid object is NOT automatically a mutation receipt, and a valid
 /// receipt for SOME mutation is not authoritative for THIS one. Validate the
 /// required MutationResult wire shape (Rust src/model.rs) — tolerating ADDITIVE
 /// fields only — AND bind it to the request: command kind, file, guard state,
-/// disposition/changed consistency, well-formed content/spans, and the
-/// COMMAND-SPECIFIC target identity (loc / heading / source+destination).
-/// Anything else is indeterminate, never accepted as success. schema_version is
-/// checked upstream.
+/// disposition/changed consistency, content===null (every adapter mutation is
+/// in-place), well-formed required/optional spans with u32 bounds, and the
+/// COMMAND-SPECIFIC target identity (loc / full section selector tuple /
+/// source+destination selectors + placement). Anything else is indeterminate,
+/// never accepted as success. schema_version is checked upstream.
 function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationExpectation): boolean {
 	if (typeof data.file !== "string" || data.file.length === 0) return false;
 	if (expect.file !== undefined && data.file !== expect.file) return false;
@@ -729,15 +761,17 @@ function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationE
 	// says guarded:false means the guard silently did not apply.
 	if (typeof data.guarded !== "boolean" || data.guarded !== expect.guarded) return false;
 	if (typeof data.line_endings !== "string" || !LINE_ENDING_STYLES.has(data.line_endings)) return false;
-	// content is a required MutationResult field: a string, or null when omitted
-	// — never a number/object.
-	if (!(data.content === null || typeof data.content === "string")) return false;
-	// invariant must carry its full required shape with well-formed spans.
+	// Every adapter mutation invokes `md -i` (in-place), whose receipt carries
+	// content:null. A content STRING is a dry-run/stdout receipt that never
+	// proves an on-disk write — reject it.
+	if (data.content !== null) return false;
+	// invariant must carry its full required shape; the span fields are Option
+	// (present key, null-or-object) with u32 bounds.
 	if (
 		!isRecord(data.invariant) ||
 		typeof data.invariant.preserves_non_target_bytes !== "boolean" ||
-		!isValidSpanOrNull(data.invariant.target_span_before) ||
-		!isValidSpanOrNull(data.invariant.target_span_after)
+		!isValidOptionalSpanField(data.invariant, "target_span_before") ||
+		!isValidOptionalSpanField(data.invariant, "target_span_after")
 	) {
 		return false;
 	}
@@ -750,16 +784,17 @@ function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationE
 	switch (expect.command) {
 		case "SetTask":
 			if (typeof inner.loc !== "string" || (expect.loc !== undefined && inner.loc !== expect.loc)) return false;
-			if (typeof inner.block_index !== "number") return false;
-			if (!isValidSpanOrNull(inner.span)) return false;
+			if (!isU32(inner.block_index)) return false;
+			// TaskItem.span is a REQUIRED SourceSpan (never null).
+			if (!isValidRequiredSpan(inner.span)) return false;
 			return true;
 		case "ReplaceSection":
-			if (expect.heading !== undefined && selectorHeading(data.target, "Section") !== expect.heading) return false;
+			if (expect.section !== undefined && !selectorMatches(refSelector(data.target, "Section"), expect.section)) return false;
 			return true;
 		case "MoveSection": {
-			const move = inner;
-			if (expect.source !== undefined && selectorHeading(move, "source") !== expect.source) return false;
-			if (expect.destination !== undefined && selectorHeading(move, "destination") !== expect.destination) return false;
+			if (expect.source !== undefined && !selectorMatches(refSelector(inner, "source"), expect.source)) return false;
+			if (expect.destination !== undefined && !selectorMatches(refSelector(inner, "destination"), expect.destination)) return false;
+			if (expect.destinationMode !== undefined && inner.destination_mode !== expect.destinationMode) return false;
 			return true;
 		}
 		default:
@@ -905,8 +940,9 @@ export class MdtoolsRuntime {
 			// legacy, never cached.
 			return { handshake: { verdict: "legacy" }, cacheable: false };
 		}
-		if (execution.killed || execution.code === null) {
-			// Transient: the probe never produced an authoritative answer.
+		if (!execution.started || execution.killed || execution.code === null) {
+			// Transient / no child spawned: the probe never produced an
+			// authoritative answer, so never cache it.
 			return { handshake: { verdict: "legacy" }, cacheable: false };
 		}
 		if (execution.code !== 0) return { handshake: { verdict: "legacy" }, cacheable: true };
@@ -993,12 +1029,14 @@ export class MdtoolsRuntime {
 		const file = resolveToolPath(this.cwd, params.file);
 		const args = this.moveSectionArgs(params, file);
 		// moveSection exposes no etag param, so the receipt must be unguarded.
+		const placementMode = { after: "after_sibling", before: "before_sibling", into: "into_as_child" } as const;
 		return await this.runJson("md_move_section", args, file, signal, {
 			command: "MoveSection",
 			file,
 			guarded: false,
-			source: params.source,
-			destination: params.destination,
+			source: sectionSelectorExpectation(params.source, params.sourceOccurrence, params.ignoreCase),
+			destination: sectionSelectorExpectation(params.destination, params.destinationOccurrence, params.ignoreCase),
+			destinationMode: placementMode[params.placement],
 		});
 	}
 
@@ -1063,7 +1101,7 @@ export class MdtoolsRuntime {
 				command: "ReplaceSection",
 				file,
 				guarded: params.expectEtag !== undefined,
-				heading: params.heading,
+				section: sectionSelectorExpectation(params.heading, params.occurrence, params.ignoreCase),
 			});
 		} finally {
 			// Cleanup must NEVER throw over the authoritative result (force + swallow).
@@ -1305,7 +1343,9 @@ export class MdtoolsRuntime {
 				}),
 			};
 		}
-		if (execution.killed || execution.code !== 0 || execution.code === null) {
+		// `started:false` means no child spawned (per the lifecycle discriminator):
+		// non-authoritative regardless of any cached/forged exit code or stdout.
+		if (!execution.started || execution.killed || execution.code !== 0 || execution.code === null) {
 			return { ok: false, result: await this.failureResult(command, file, execution, signal, mutating, observed) };
 		}
 
