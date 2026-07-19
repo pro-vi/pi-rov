@@ -14,6 +14,7 @@ the ones you want.
 | [`pi-canvas`](packages/pi-canvas) | Stateful, reviewable canvas artifacts — an actable surface the agent composes from declared interaction points and digests as structured state. |
 | [`pi-tool-distill`](packages/pi-tool-distill) | Recoverable semantic compression of tool results, to keep long sessions inside the context budget. |
 | [`pi-codex-fast-mode`](packages/pi-codex-fast-mode) | Enables OpenAI Codex fast mode via `service_tier=priority`. |
+| [`pi-mdtools`](packages/pi-mdtools) | Structural Markdown editing — sections, checkboxes, and blocks addressed by structure, wrapping the [`mdtools`](https://github.com/pro-vi/mdtools) `md` binary as typed Pi tools. Requires the `md` binary on PATH. |
 
 ## Install
 
@@ -23,6 +24,7 @@ Each package installs independently:
 pi install npm:pi-canvas
 pi install npm:pi-tool-distill
 pi install npm:pi-codex-fast-mode
+pi install npm:pi-mdtools
 ```
 
 See each package's own README for configuration and usage.
@@ -53,7 +55,8 @@ pi-rov/
 └── packages/
     ├── pi-canvas/
     ├── pi-tool-distill/
-    └── pi-codex-fast-mode/
+    ├── pi-codex-fast-mode/
+    └── pi-mdtools/
 ```
 
 Each package is self-contained: its own `package.json`, `pi` manifest, tests, and `pi-package`
