@@ -443,7 +443,7 @@ test("receipt is request-bound: ReplaceSection receipt for a different occurrenc
 			Section: {
 				kind: "Section",
 				selector: { kind: "HeadingText", heading_text: "Dup", occurrence: 1, match_mode: "Exact" },
-				section: { etag: "e" },
+				section: { span: SPAN, etag: "e" },
 			},
 		},
 	});
@@ -461,8 +461,8 @@ test("receipt is request-bound: MoveSection receipt with a different placement i
 		target: {
 			SectionMove: {
 				kind: "SectionMove",
-				source: { selector: { kind: "HeadingText", heading_text: "A", occurrence: null, match_mode: "Exact" } },
-				destination: { selector: { kind: "HeadingText", heading_text: "B", occurrence: null, match_mode: "Exact" } },
+				source: { selector: { kind: "HeadingText", heading_text: "A", occurrence: null, match_mode: "Exact" }, section: { span: SPAN, etag: "e" } },
+				destination: { selector: { kind: "HeadingText", heading_text: "B", occurrence: null, match_mode: "Exact" }, section: { span: SPAN, etag: "e" } },
 				destination_mode: "after_sibling", // we asked for "into"
 			},
 		},
@@ -507,6 +507,28 @@ test("receipt with a null required task span is indeterminate", async () => {
 	assert.equal(result.mutationOutcome, "indeterminate");
 });
 
+test("receipt with a truncated section (matching selector, no section span/etag) is indeterminate", async () => {
+	// Independent-review finding: a ReplaceSection receipt whose selector matches
+	// but whose nested SectionEntry is truncated must not be accepted — the
+	// binding depth must equal SetTask's (which validates span/block_index).
+	const truncated = receipt({
+		command: "ReplaceSection",
+		disposition: "Replaced",
+		changed: true,
+		target: {
+			Section: {
+				kind: "Section",
+				selector: { kind: "HeadingText", heading_text: "Alpha", occurrence: null, match_mode: "Exact" },
+				// section deliberately omitted / truncated
+			},
+		},
+	});
+	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, truncated)));
+	const result = await runtime.replaceSection({ file: "doc.md", heading: "Alpha", content: "x" });
+	assert.equal(result.status, "failed");
+	assert.equal(result.mutationOutcome, "indeterminate");
+});
+
 test("lifecycle: started:false with exit 0 is not accepted as completed", async () => {
 	// A runner that reports a (cached/forged) valid receipt WITHOUT spawning.
 	const r = receipt({ command: "SetTask", target: { TaskItem: { kind: "TaskItem", loc: "1.0", block_index: 1, child_path: [0], span: SPAN } } });
@@ -521,7 +543,7 @@ test("receipt is request-bound: ReplaceSection receipt for a different heading i
 		command: "ReplaceSection",
 		disposition: "Replaced",
 		changed: true,
-		target: { Section: { kind: "Section", selector: { heading_text: "Other", occurrence: null, match_mode: "Exact" }, section: { etag: "e" } } },
+		target: { Section: { kind: "Section", selector: { kind: "HeadingText", heading_text: "Other", occurrence: null, match_mode: "Exact" }, section: { span: SPAN, etag: "e" } } },
 	});
 	const { runtime } = fakeRuntime(withSchema(SCHEMA_OK, (request) => execution(request, wrong)));
 	const result = await runtime.replaceSection({ file: "doc.md", heading: "Alpha", content: "x" });
@@ -537,8 +559,8 @@ test("receipt is request-bound: MoveSection receipt for different selectors is i
 		target: {
 			SectionMove: {
 				kind: "SectionMove",
-				source: { selector: { heading_text: "WrongSource" } },
-				destination: { selector: { heading_text: "WrongDest" } },
+				source: { selector: { kind: "HeadingText", heading_text: "WrongSource", occurrence: null, match_mode: "Exact" }, section: { span: SPAN, etag: "e" } },
+				destination: { selector: { kind: "HeadingText", heading_text: "WrongDest", occurrence: null, match_mode: "Exact" }, section: { span: SPAN, etag: "e" } },
 			},
 		},
 	});

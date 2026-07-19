@@ -733,11 +733,16 @@ function selectorMatches(selector: unknown, expect: SelectorExpectation): boolea
 	);
 }
 
-/// The SectionSelector inside a SectionTargetRef at `target[discriminant]`.
-function refSelector(target: unknown, discriminant: string): unknown {
-	if (!isRecord(target)) return undefined;
-	const ref = target[discriminant];
-	return isRecord(ref) ? ref.selector : undefined;
+/// A SectionTargetRef (Rust): its selector must match the requested selector
+/// AND its nested SectionEntry must carry the required shape the real binary
+/// always emits (a well-formed span + string etag) — the same depth of
+/// structural binding SetTask applies to its TaskItem, so a truncated
+/// selector-only receipt (real binary never emits one) is rejected too.
+function sectionRefMatches(ref: unknown, expect: SelectorExpectation | undefined): boolean {
+	if (!isRecord(ref)) return false;
+	if (!isRecord(ref.section) || !isValidRequiredSpan(ref.section.span) || typeof ref.section.etag !== "string") return false;
+	if (expect !== undefined && !selectorMatches(ref.selector, expect)) return false;
+	return true;
 }
 
 /// A schema-valid object is NOT automatically a mutation receipt, and a valid
@@ -789,11 +794,12 @@ function isValidMutationReceipt(data: Record<string, unknown>, expect: MutationE
 			if (!isValidRequiredSpan(inner.span)) return false;
 			return true;
 		case "ReplaceSection":
-			if (expect.section !== undefined && !selectorMatches(refSelector(data.target, "Section"), expect.section)) return false;
+			// inner IS the SectionTargetRef (target.Section).
+			if (!sectionRefMatches(inner, expect.section)) return false;
 			return true;
 		case "MoveSection": {
-			if (expect.source !== undefined && !selectorMatches(refSelector(inner, "source"), expect.source)) return false;
-			if (expect.destination !== undefined && !selectorMatches(refSelector(inner, "destination"), expect.destination)) return false;
+			if (!sectionRefMatches(inner.source, expect.source)) return false;
+			if (!sectionRefMatches(inner.destination, expect.destination)) return false;
 			if (expect.destinationMode !== undefined && inner.destination_mode !== expect.destinationMode) return false;
 			return true;
 		}
