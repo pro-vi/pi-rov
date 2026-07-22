@@ -8,6 +8,9 @@ logs/
 reports/
 *.log
 
+# local async message queue (.inbox convention) — never committed to a public repo
+.inbox/
+
 # secrets
 .env
 .env.*
