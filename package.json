@@ -2,7 +2,7 @@
   "name": "pi-rov",
   "version": "0.0.0",
   "private": true,
-  "description": "pro-vi's suite of Pi coding-agent extensions.",
+  "description": "Repository for pro-vi's Pi coding-agent extensions.",
   "author": "pro-vi",
   "license": "MIT",
   "homepage": "https://github.com/pro-vi/pi-rov#readme",
@@ -14,21 +14,6 @@
     "url": "git+https://github.com/pro-vi/pi-rov.git"
   },
   "type": "module",
-  "workspaces": [
-    "packages/*"
-  ],
-  "pi": {
-    "extensions": [
-      "./packages/pi-canvas/src/index.ts",
-      "./packages/pi-tool-distill/src/index.ts",
-      "./packages/pi-codex-fast-mode/index.ts"
-    ]
-  },
-  "scripts": {
-    "check": "npm run check --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present"
-  },
   "engines": {
     "node": ">=22"
   }
