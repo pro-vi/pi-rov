@@ -11,6 +11,9 @@ reports/
 # local async message queue (.inbox convention) — never committed to a public repo
 .inbox/
 
+# local agent session data written by session hooks — never committed to a public repo
+.claude/data/
+
 # secrets
 .env
 .env.*
